@@ -51,9 +51,9 @@ CONTAINS
 
 ! **************************************************************************************************
 !> \brief Transform one real-space operator to a k point and start its redistribution.
-!>        The real and imaginary parts are densified into fmwork(1:2) and their transfer
-!>        to the k-point group distribution is started. Both transfers receive into
-!>        private buffers, so any number of starts may target the same fmlocal.
+!>        The real and imaginary parts are densified into fm_re and fm_im, and their
+!>        transfer to the k-point group distribution is started. Both transfers receive
+!>        into private buffers, so any number of starts may target the same fmlocal.
 !>        The results are collected with kp_evp_op_finish_cfm.
 !> \param rsmat real-space image matrices of the operator
 !> \param ispin spin component of rsmat (1 for spin-free matrices such as S)
@@ -66,7 +66,8 @@ CONTAINS
 !> \param rmatrix workspace holding the real part of the k-point matrix
 !> \param cmatrix workspace holding the imaginary part of the k-point matrix
 !> \param tmpmat unsymmetric DBCSR workspace
-!> \param fmwork full-matrix workspaces on the global communicator, needs slots 1 and 2
+!> \param fm_re full-matrix workspace of the global communicator holding the real part
+!> \param fm_im full-matrix workspace of the global communicator holding the imaginary part
 !> \param target_fm transfer target on the k-point group (fmlocal, or fmdummy to keep
 !>        collective calls balanced on groups one does not own)
 !> \param para_env communicator of source and target distributions
@@ -74,7 +75,7 @@ CONTAINS
 !> \param info_im transfer state of the imaginary part
 ! **************************************************************************************************
    SUBROUTINE kp_evp_op_start(rsmat, ispin, ik, xkp, cell_to_index, sab_nl, grid, use_grid, &
-                              rmatrix, cmatrix, tmpmat, fmwork, target_fm, para_env, info_re, info_im)
+                              rmatrix, cmatrix, tmpmat, fm_re, fm_im, target_fm, para_env, info_re, info_im)
 
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: rsmat
       INTEGER, INTENT(IN)                                :: ispin, ik
@@ -85,8 +86,7 @@ CONTAINS
       TYPE(rskp_grid_type), INTENT(IN), OPTIONAL         :: grid
       LOGICAL, INTENT(IN)                                :: use_grid
       TYPE(dbcsr_type)                                   :: rmatrix, cmatrix, tmpmat
-      TYPE(cp_fm_type), DIMENSION(:), POINTER            :: fmwork
-      TYPE(cp_fm_type)                                   :: target_fm
+      TYPE(cp_fm_type)                                   :: fm_re, fm_im, target_fm
       TYPE(mp_para_env_type), POINTER                    :: para_env
       TYPE(copy_info_type)                               :: info_re, info_im
 
@@ -106,12 +106,12 @@ CONTAINS
                              xkp=xkp, cell_to_index=cell_to_index, sab_nl=sab_nl)
       END IF
       CALL dbcsr_desymmetrize(rmatrix, tmpmat)
-      CALL copy_dbcsr_to_fm(tmpmat, fmwork(1))
+      CALL copy_dbcsr_to_fm(tmpmat, fm_re)
       CALL dbcsr_desymmetrize(cmatrix, tmpmat)
-      CALL copy_dbcsr_to_fm(tmpmat, fmwork(2))
+      CALL copy_dbcsr_to_fm(tmpmat, fm_im)
 
-      CALL cp_fm_start_copy_general(fmwork(1), target_fm, para_env, info_re)
-      CALL cp_fm_start_copy_general(fmwork(2), target_fm, para_env, info_im)
+      CALL cp_fm_start_copy_general(fm_re, target_fm, para_env, info_re)
+      CALL cp_fm_start_copy_general(fm_im, target_fm, para_env, info_im)
 
       CALL timestop(handle)
 
@@ -189,8 +189,9 @@ CONTAINS
 
       CALL kp_evp_op_start(rsmat=rsmat_kp, ispin=ispin, ik=ikp, xkp=xkp(1:3, ikp), &
                            cell_to_index=cell_to_index, sab_nl=sab_nl, use_grid=.FALSE., &
-                           rmatrix=rmatrix, cmatrix=cmatrix, tmpmat=tmpmat, fmwork=fmwork, &
-                           target_fm=fmlocal, para_env=para_env, info_re=info_re, info_im=info_im)
+                           rmatrix=rmatrix, cmatrix=cmatrix, tmpmat=tmpmat, fm_re=fmwork(1), &
+                           fm_im=fmwork(2), target_fm=fmlocal, para_env=para_env, &
+                           info_re=info_re, info_im=info_im)
       CALL kp_evp_op_finish_cfm(fmlocal, info_re, cmat, .FALSE.)
       CALL kp_evp_op_finish_cfm(fmlocal, info_im, cmat, .TRUE.)
       CALL cp_fm_cleanup_copy_general(info_re)
