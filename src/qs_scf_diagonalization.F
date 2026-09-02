@@ -123,6 +123,7 @@ MODULE qs_scf_diagonalization
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
    USE qs_gspace_mixing,                ONLY: gspace_mixing
+   USE qs_kp_evp_methods,               ONLY: kp_evp_build_operator
    USE qs_ks_methods,                   ONLY: qs_ks_update_qs_env
    USE qs_ks_types,                     ONLY: qs_ks_did_change,&
                                               qs_ks_env_type
@@ -3373,71 +3374,6 @@ CONTAINS
    END SUBROUTINE do_block_davidson_diag
 
 ! **************************************************************************************************
-!> \brief transforms one real-space operator to the complex full matrix of a
-!>        K point: rskp_transform into the dbcsr pair, then redistribution to
-!>        the kpoint-group BLACS context of cmat (the copy_general dance of
-!>        do_general_diag_kp)
-!> \param rsmat_kp real-space operator, dbcsr image set
-!> \param ispin spin component of rsmat_kp
-!> \param ikp index of the K point in xkp
-!> \param xkp K point coordinates
-!> \param cell_to_index ...
-!> \param sab_nl ...
-!> \param rmatrix symmetric real-part scratch
-!> \param cmatrix antisymmetric imaginary-part scratch
-!> \param tmpmat no-symmetry desymmetrization scratch
-!> \param fmwork global-context full-matrix scratch, fmwork(1:2)
-!> \param fmlocal kpoint-group full-matrix redistribution target
-!> \param para_env communicator of the kpoint groups
-!> \param info_re redistribution state of the real part
-!> \param info_im redistribution state of the imaginary part
-!> \param cmat complex output matrix, overwritten
-! **************************************************************************************************
-   SUBROUTINE assemble_cksmat(rsmat_kp, ispin, ikp, xkp, cell_to_index, sab_nl, &
-                              rmatrix, cmatrix, tmpmat, fmwork, fmlocal, para_env, &
-                              info_re, info_im, cmat)
-
-      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: rsmat_kp
-      INTEGER, INTENT(IN)                                :: ispin, ikp
-      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: xkp
-      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
-      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
-         POINTER                                         :: sab_nl
-      TYPE(dbcsr_type), POINTER                          :: rmatrix, cmatrix, tmpmat
-      TYPE(cp_fm_type), DIMENSION(:), POINTER            :: fmwork
-      TYPE(cp_fm_type)                                   :: fmlocal
-      TYPE(mp_para_env_type), POINTER                    :: para_env
-      TYPE(copy_info_type)                               :: info_re, info_im
-      TYPE(cp_cfm_type)                                  :: cmat
-
-      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'assemble_cksmat'
-
-      INTEGER                                            :: handle
-
-      CALL timeset(routineN, handle)
-
-      CALL dbcsr_set(rmatrix, 0.0_dp)
-      CALL dbcsr_set(cmatrix, 0.0_dp)
-      CALL rskp_transform(rmatrix=rmatrix, cmatrix=cmatrix, rsmat=rsmat_kp, ispin=ispin, &
-                          xkp=xkp(1:3, ikp), cell_to_index=cell_to_index, sab_nl=sab_nl)
-      CALL dbcsr_desymmetrize(rmatrix, tmpmat)
-      CALL copy_dbcsr_to_fm(tmpmat, fmwork(1))
-      CALL dbcsr_desymmetrize(cmatrix, tmpmat)
-      CALL copy_dbcsr_to_fm(tmpmat, fmwork(2))
-      CALL cp_fm_start_copy_general(fmwork(1), fmlocal, para_env, info_re)
-      CALL cp_fm_finish_copy_general(fmlocal, info_re)
-      CALL cp_cfm_scale_and_add_fm(z_zero, cmat, z_one, fmlocal)
-      CALL cp_fm_start_copy_general(fmwork(2), fmlocal, para_env, info_im)
-      CALL cp_fm_finish_copy_general(fmlocal, info_im)
-      CALL cp_cfm_scale_and_add_fm(z_one, cmat, gaussi, fmlocal)
-      CALL cp_fm_cleanup_copy_general(info_re)
-      CALL cp_fm_cleanup_copy_general(info_im)
-
-      CALL timestop(handle)
-
-   END SUBROUTINE assemble_cksmat
-
-! **************************************************************************************************
 !> \brief block-Davidson SCF step for complex K points, one channel per
 !>        (local kpoint, spin); mirrors do_block_davidson_diag for the
 !>        preconditioner scheduling and do_general_diag_kp for the H(k)/S(k)
@@ -3470,7 +3406,6 @@ CONTAINS
       LOGICAL                                            :: do_prec, use_real_wfn
       REAL(KIND=dp)                                      :: eps_iter, eps_iter_empty
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: xkp
-      TYPE(copy_info_type)                               :: info_im, info_re
       TYPE(cp_cfm_type)                                  :: cksmat, csmat
       TYPE(cp_fm_pool_p_type), DIMENSION(:), POINTER     :: ao_ao_fm_pools, kp_ao_ao_fm_pools
       TYPE(cp_fm_struct_type), POINTER                   :: matrix_struct
@@ -3638,24 +3573,20 @@ CONTAINS
             ! MOS with S(k)-orthonormal coefficients of the current geometry, so
             ! the Davidson update below consumes them directly as trial subspace.
             DO ispin = 1, nspin
-               CALL assemble_cksmat(matrix_ks_kp, ispin, ikp, xkp, cell_to_index, sab_nl, &
-                                    rmatrix, cmatrix, tmpmat, fmwork, fmlocal, para_env, &
-                                    info_re, info_im, cksmat)
-               CALL assemble_cksmat(matrix_s_kp, 1, ikp, xkp, cell_to_index, sab_nl, &
-                                    rmatrix, cmatrix, tmpmat, fmwork, fmlocal, para_env, &
-                                    info_re, info_im, csmat)
+               CALL kp_evp_build_operator(matrix_ks_kp, ispin, ikp, xkp, cell_to_index, sab_nl, &
+                                          rmatrix, cmatrix, tmpmat, fmwork, fmlocal, para_env, cksmat)
+               CALL kp_evp_build_operator(matrix_s_kp, 1, ikp, xkp, cell_to_index, sab_nl, &
+                                          rmatrix, cmatrix, tmpmat, fmwork, fmlocal, para_env, csmat)
                CALL cold_start_mo_init(kp, ispin, cksmat, csmat)
             END DO
          ELSE
             ! S(k) is spin independent
-            CALL assemble_cksmat(matrix_s_kp, 1, ikp, xkp, cell_to_index, sab_nl, &
-                                 rmatrix, cmatrix, tmpmat, fmwork, fmlocal, para_env, &
-                                 info_re, info_im, csmat)
+            CALL kp_evp_build_operator(matrix_s_kp, 1, ikp, xkp, cell_to_index, sab_nl, &
+                                       rmatrix, cmatrix, tmpmat, fmwork, fmlocal, para_env, csmat)
             DO ispin = 1, nspin
                channel = (local_kpoint - 1)*nspin + ispin
-               CALL assemble_cksmat(matrix_ks_kp, ispin, ikp, xkp, cell_to_index, sab_nl, &
-                                    rmatrix, cmatrix, tmpmat, fmwork, fmlocal, para_env, &
-                                    info_re, info_im, cksmat)
+               CALL kp_evp_build_operator(matrix_ks_kp, ispin, ikp, xkp, cell_to_index, sab_nl, &
+                                          rmatrix, cmatrix, tmpmat, fmwork, fmlocal, para_env, cksmat)
 
                IF (do_prec) THEN
                   CALL generate_extended_space_c(scf_env%block_davidson_env(channel), &
