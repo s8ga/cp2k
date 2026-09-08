@@ -25,8 +25,27 @@
 # unoccupied MOS converge five times looser
 "Al-kpoint-dav-smear-adapt.inp"         = [{matcher="E_total", tol=1e-9, ref=-8.159987079852488}]
 # blocked Davidson at complex K points, same oracle energy as the OT family below
+# block Krylov (Lanczos) refinement at complex K points, same oracle energy as
+# the Davidson and OT families
+"he_lan.inp"                            = [{matcher="E_total", tol=1e-9, ref=-2.89466358139099},
+                                           {matcher="N_special_kpoints", tol=0.0, ref=4}]
 "he_dav.inp"                            = [{matcher="E_total", tol=1e-9, ref=-2.89466358139099},
                                            {matcher="N_special_kpoints", tol=0.0, ref=4}]
+# block Krylov (Lanczos) refinement with the adaptive inner tolerance, same
+# oracle energy as he_lan
+"he_lan_adapt.inp"                      = [{matcher="E_total", tol=1e-9, ref=-2.89466358139099},
+                                           {matcher="N_special_kpoints", tol=0.0, ref=4}]
+# the Lanczos counterpart of the STANDARD/Davidson Al smearing family. The
+# empty-state residual of the refinement has a structural floor (inherited
+# from the Gamma kernel), so the SCF threshold is paired with it Gamma-style:
+# an unreachable EPS_SCF with IGNORE_CONVERGENCE_FAILURE polishes the fixed
+# point, the energy lands 1.1E-9 from the Davidson oracle
+"Al-kpoint-lan-smear.inp"               = [{matcher="E_total", tol=1e-8, ref=-8.159987079852488}]
+# same with ADDED_MOS AUTO at a raised temperature: the virtual space grows
+# twice (4 -> 8 -> 16) and the energy matches the fixed-count twin with 16
+# added MOS within 1.6E-9
+"Al-kpoint-lan-smear-auto.inp"          = [{matcher="E_total", tol=1e-8, ref=-8.173546697911490}]
+
 "he_dav_full_all.inp"                   = [{matcher="E_total", tol=1e-9, ref=-2.89466358139099},
                                            {matcher="N_special_kpoints", tol=0.0, ref=4}]
 "he_dav_s_inverse.inp"                  = [{matcher="E_total", tol=1e-9, ref=-2.89466358139099},
