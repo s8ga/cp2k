@@ -913,15 +913,19 @@ CONTAINS
             IF (dft_control%roks) THEN
                CPABORT("ROKS with block PF diagonalization not possible")
             END IF
-            IF (do_kpoints) THEN
-               CPABORT("Block Krylov diagonalization not possible with kpoint calculations")
-            END IF
             scf_env%method = block_krylov_diag_method_nr
-            scf_env%needs_ortho = .TRUE.
             IF (.NOT. ASSOCIATED(scf_env%krylov_space)) THEN
                CALL krylov_space_create(scf_env%krylov_space, scf_section)
             END IF
-            CALL krylov_space_allocate(scf_env%krylov_space, scf_control, mos)
+            IF (do_kpoints) THEN
+               ! settings-only Krylov environment: the complex kernel keeps its
+               ! scratch local to the call, nothing is allocated from the Gamma
+               ! MOS, and the K-point world never uses scf_env%ortho
+               scf_env%needs_ortho = .FALSE.
+            ELSE
+               scf_env%needs_ortho = .TRUE.
+               CALL krylov_space_allocate(scf_env%krylov_space, scf_control, mos)
+            END IF
             ! Block davidson diagonlization: allocation of additional matrices is needed
          CASE (diag_block_davidson)
             scf_env%method = block_davidson_diag_method_nr
