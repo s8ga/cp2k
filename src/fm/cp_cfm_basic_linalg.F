@@ -17,7 +17,9 @@ MODULE cp_cfm_basic_linalg
    USE cp_blacs_env,                    ONLY: cp_blacs_env_type
    USE cp_cfm_types,                    ONLY: cp_cfm_create,&
                                               cp_cfm_get_info,&
+                                              cp_cfm_get_submatrix,&
                                               cp_cfm_release,&
+                                              cp_cfm_set_submatrix,&
                                               cp_cfm_to_cfm,&
                                               cp_cfm_type
    USE cp_fm_struct,                    ONLY: cp_fm_struct_equivalent
@@ -55,7 +57,8 @@ MODULE cp_cfm_basic_linalg
              cp_cfm_rot_cols, &
              cp_cfm_det, & ! determinant of a complex matrix with correct sign
              cp_cfm_uplo_to_full, &
-             cp_cfm_vectorsnorm
+             cp_cfm_vectorsnorm, &
+             cp_cfm_qr_factorization ! compute the QR factorization of a rectangular complex matrix
 
    REAL(kind=dp), EXTERNAL :: zlange, pzlange
 
@@ -1470,5 +1473,106 @@ CONTAINS
 
       CALL timestop(handle)
    END SUBROUTINE cp_cfm_get_diag
+
+! **************************************************************************************************
+!> \brief compute the QR factorization of a rectangular complex matrix,
+!>        mirroring cp_fm_qr_factorization: matrix_a is overwritten with the
+!>        Householder reflections, matrix_r receives the R factor with the
+!>        complementary triangle zeroed according to uplo
+!> \param matrix_a ...
+!> \param matrix_r ...
+!> \param nrow_fact ...
+!> \param ncol_fact ...
+!> \param first_row ...
+!> \param first_col ...
+!> \param uplo ...
+!> \par History
+!>      09.2026 created mirroring cp_fm_qr_factorization
+! **************************************************************************************************
+   SUBROUTINE cp_cfm_qr_factorization(matrix_a, matrix_r, nrow_fact, ncol_fact, first_row, first_col, uplo)
+      TYPE(cp_cfm_type), INTENT(INOUT)                  :: matrix_a, matrix_r
+      INTEGER, INTENT(IN), OPTIONAL                     :: nrow_fact, ncol_fact, &
+                                                           first_row, first_col
+      CHARACTER, INTENT(IN), OPTIONAL                   :: uplo
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'cp_cfm_qr_factorization'
+
+      CHARACTER                                        :: myuplo
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:)      :: tau, work
+      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)   :: r_mat
+      COMPLEX(KIND=dp), DIMENSION(:, :), POINTER       :: a
+      INTEGER                                          :: handle, i, icol, info, irow, &
+                                                          j, lda, lwork, ncol, ndim, nrow
+#if defined(__parallel)
+      INTEGER, DIMENSION(9)                            :: desca
+#endif
+
+      CALL timeset(routineN, handle)
+
+      myuplo = 'U'
+      IF (PRESENT(uplo)) myuplo = uplo
+
+      ncol = matrix_a%matrix_struct%ncol_global
+      nrow = matrix_a%matrix_struct%nrow_global
+      lda = nrow
+
+      a => matrix_a%local_data
+
+      IF (PRESENT(nrow_fact)) nrow = nrow_fact
+      IF (PRESENT(ncol_fact)) ncol = ncol_fact
+      irow = 1
+      IF (PRESENT(first_row)) irow = first_row
+      icol = 1
+      IF (PRESENT(first_col)) icol = first_col
+
+      CPASSERT(nrow >= ncol)
+      ndim = SIZE(a, 2)
+      ALLOCATE (tau(ndim))
+
+#if defined(__parallel)
+
+      desca(:) = matrix_a%matrix_struct%descriptor(:)
+
+      lwork = -1
+      ALLOCATE (work(2*ndim))
+      CALL pzgeqrf(nrow, ncol, a, irow, icol, desca, tau, work, lwork, info)
+      lwork = INT(work(1))
+      DEALLOCATE (work)
+      ALLOCATE (work(lwork))
+      CALL pzgeqrf(nrow, ncol, a, irow, icol, desca, tau, work, lwork, info)
+
+#else
+      lwork = -1
+      ALLOCATE (work(2*ndim))
+      CALL zgeqrf(nrow, ncol, a, lda, tau, work, lwork, info)
+      lwork = INT(work(1))
+      DEALLOCATE (work)
+      ALLOCATE (work(lwork))
+      CALL zgeqrf(nrow, ncol, a, lda, tau, work, lwork, info)
+
+#endif
+
+      ALLOCATE (r_mat(ncol, ncol))
+      CALL cp_cfm_get_submatrix(matrix_a, r_mat, 1, 1, ncol, ncol)
+      IF ((myuplo == "U") .OR. (myuplo == "u")) THEN
+         DO i = 1, ncol
+            DO j = i + 1, ncol
+               r_mat(j, i) = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+            END DO
+         END DO
+      ELSE
+         DO j = 1, ncol
+            DO i = j + 1, ncol
+               r_mat(i, j) = CMPLX(0.0_dp, 0.0_dp, KIND=dp)
+            END DO
+         END DO
+      END IF
+      CALL cp_cfm_set_submatrix(matrix_r, r_mat, 1, 1, ncol, ncol)
+
+      DEALLOCATE (tau, work, r_mat)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE cp_cfm_qr_factorization
 
 END MODULE cp_cfm_basic_linalg
