@@ -26,13 +26,7 @@ MODULE cell_opt_utils
                                               cp_logger_set,&
                                               cp_logger_type,&
                                               cp_to_string
-   USE input_constants,                 ONLY: fix_none,&
-                                              fix_x,&
-                                              fix_xy,&
-                                              fix_xz,&
-                                              fix_y,&
-                                              fix_yz,&
-                                              fix_z
+   USE input_constants,                 ONLY: fix_none
    USE input_cp2k_global,               ONLY: create_global_section
    USE input_enumeration_types,         ONLY: enum_i2c,&
                                               enumeration_type
@@ -51,6 +45,7 @@ MODULE cell_opt_utils
    USE mathlib,                         ONLY: angle,&
                                               det_3x3
    USE message_passing,                 ONLY: mp_para_env_type
+   USE string_utilities,                ONLY: uppercase
 #include "../base/base_uses.f90"
 
    IMPLICIT NONE
@@ -61,7 +56,36 @@ MODULE cell_opt_utils
 
    PUBLIC :: get_dg_dh, gopt_new_logger_create, &
              gopt_new_logger_release, read_external_press_tensor, &
-             apply_cell_constraints, rescale_new_cell_volume
+             apply_cell_constraints, cell_opt_constraint_label, parse_cell_constraint, &
+             rescale_new_cell_volume
+
+   ! Masks of the six independent cell optimization variables in the canonical
+   ! frame (a along x, b in the xy plane): AX, BX, BY, CX, CY, CZ.
+   ! A set bit means that the component is FIXED by a CONSTRAINT, while
+   ! constraint_id = 0 (fix_none) leaves all components relaxable.
+   INTEGER, PARAMETER, PUBLIC :: comp_ax = 2**0, & ! a(x)
+                                 comp_bx = 2**1, & ! b(x)
+                                 comp_by = 2**2, & ! b(y)
+                                 comp_cx = 2**3, & ! c(x)
+                                 comp_cy = 2**4, & ! c(y)
+                                 comp_cz = 2**5  ! c(z)
+   ! Shorthands for complete cell vectors, Cartesian directions and coupled
+   ! component sets (unions of disjoint bits, hence representable as sums)
+   INTEGER, PARAMETER, PUBLIC :: mask_a = comp_ax, &
+                                 mask_b = comp_bx + comp_by, &
+                                 mask_c = comp_cx + comp_cy + comp_cz, &
+                                 mask_x = comp_ax + comp_bx + comp_cx, &
+                                 mask_y = comp_bx + comp_by + comp_cy, &
+                                 mask_z = mask_c, &
+                                 mask_xy = comp_ax + comp_bx + comp_by + comp_cx + comp_cy, &
+                                 mask_xz = comp_ax + comp_bx + comp_cx + comp_cy + comp_cz, &
+                                 mask_yz = comp_bx + comp_by + comp_cx + comp_cy + comp_cz, &
+                                 mask_diag = comp_ax + comp_by + comp_cz, &
+                                 mask_diag_ab = comp_ax + comp_by, &
+                                 mask_diag_ac = comp_ax + comp_cz, &
+                                 mask_diag_bc = comp_by + comp_cz, &
+                                 mask_ab_plane = comp_ax + comp_bx + comp_by, &
+                                 mask_all = comp_ax + comp_bx + comp_by + comp_cx + comp_cy + comp_cz
 
 CONTAINS
 
@@ -217,6 +241,151 @@ CONTAINS
    END SUBROUTINE read_external_press_tensor
 
 ! **************************************************************************************************
+!> \brief Parses the tokens of the CONSTRAINT keyword into a cell component mask
+!> \param constraint_tokens tokens of the CONSTRAINT keyword (n_var=-1 string)
+!> \param cell simulation cell (only the periodicity is used)
+!> \param explicit whether the CONSTRAINT keyword was given explicitly
+!> \param mask union of the fixed cell components (comp_* and mask_* bits)
+! **************************************************************************************************
+   SUBROUTINE parse_cell_constraint(constraint_tokens, cell, explicit, mask)
+      CHARACTER(LEN=default_string_length), &
+         DIMENSION(:), POINTER                           :: constraint_tokens
+      TYPE(cell_type), POINTER                           :: cell
+      LOGICAL, INTENT(IN)                                :: explicit
+      INTEGER, INTENT(OUT)                               :: mask
+
+      CHARACTER(LEN=default_string_length)               :: token
+      INTEGER                                            :: i, nonperiodic_axis, required_mask, &
+                                                            tok_mask
+
+      CPASSERT(ASSOCIATED(constraint_tokens))
+      IF (SIZE(constraint_tokens) > 16) THEN
+         CALL cp_abort(__LOCATION__, &
+                       "CELL_OPT CONSTRAINT accepts at most 16 tokens.")
+      END IF
+
+      mask = 0
+      DO i = 1, SIZE(constraint_tokens)
+         token = TRIM(ADJUSTL(constraint_tokens(i)))
+         CALL uppercase(token)
+         IF (token == "NONE") THEN
+            IF (SIZE(constraint_tokens) > 1) THEN
+               CALL cp_abort(__LOCATION__, &
+                             "CELL_OPT CONSTRAINT NONE cannot be combined "// &
+                             "with other tokens.")
+            END IF
+            mask = 0
+            CYCLE
+         END IF
+         SELECT CASE (token)
+         CASE ("A", "AX")
+            tok_mask = comp_ax
+         CASE ("B")
+            tok_mask = mask_b
+         CASE ("BX")
+            tok_mask = comp_bx
+         CASE ("BY")
+            tok_mask = comp_by
+         CASE ("C", "Z")
+            tok_mask = mask_c
+         CASE ("CX")
+            tok_mask = comp_cx
+         CASE ("CY")
+            tok_mask = comp_cy
+         CASE ("CZ")
+            tok_mask = comp_cz
+         CASE ("X")
+            tok_mask = mask_x
+         CASE ("Y")
+            tok_mask = mask_y
+         CASE ("XY")
+            tok_mask = mask_xy
+         CASE ("XZ")
+            tok_mask = mask_xz
+         CASE ("YZ")
+            tok_mask = mask_yz
+         CASE ("ALPHA", "BETA", "GAMMA")
+            CALL cp_abort(__LOCATION__, &
+                          "CELL_OPT CONSTRAINT on angles (ALPHA, BETA, "// &
+                          "GAMMA) is not supported yet.")
+         CASE DEFAULT
+            CALL cp_abort(__LOCATION__, &
+                          "Unknown CELL_OPT CONSTRAINT token: "//TRIM(token))
+         END SELECT
+         IF (IAND(tok_mask, mask) /= 0) THEN
+            CALL cp_warn(__LOCATION__, &
+                         "Redundant CELL_OPT CONSTRAINT token: "//TRIM(token)// &
+                         " (components already constrained).")
+         END IF
+         mask = IOR(mask, tok_mask)
+      END DO
+
+      ! For 2D periodicity the non-periodic cell direction must be constrained;
+      ! complete the constraint automatically if the keyword was not given
+      IF (COUNT(cell%perd /= 0) == 2) THEN
+         nonperiodic_axis = FINDLOC(cell%perd, 0, dim=1)
+         required_mask = 0
+         SELECT CASE (nonperiodic_axis)
+         CASE (1)
+            required_mask = mask_x
+         CASE (2)
+            required_mask = mask_y
+         CASE (3)
+            required_mask = mask_z
+         END SELECT
+         IF (.NOT. explicit .AND. mask == 0) THEN
+            mask = required_mask
+            CALL cp_warn(__LOCATION__, &
+                         "2D CELL_OPT: constraining non-periodic cell direction.")
+         ELSE IF (IAND(mask, required_mask) /= required_mask) THEN
+            CALL cp_abort(__LOCATION__, &
+                          "2D CELL_OPT needs constrained non-periodic cell direction.")
+         END IF
+      END IF
+
+   END SUBROUTINE parse_cell_constraint
+
+! **************************************************************************************************
+!> \brief Returns the label of the consolidated cell constraint mask
+!> \param mask bit mask of fixed cell components (comp_* / mask_* bits)
+!> \return the historical four-character labels ("   X", "  XY", "NONE") for
+!>         the legacy constraint values (padded for backward compatible
+!>         printing), the fixed components spelled out ("AX BX BY") otherwise
+! **************************************************************************************************
+   PURE FUNCTION cell_opt_constraint_label(mask) RESULT(label)
+      INTEGER, INTENT(IN)                                :: mask
+      CHARACTER(LEN=63)                                  :: label
+
+      SELECT CASE (mask)
+      CASE (fix_none)
+         label = "NONE"
+      CASE (mask_x)
+         label = "   X"
+      CASE (mask_y)
+         label = "   Y"
+      CASE (mask_z)
+         label = "   Z"
+      CASE (mask_xy)
+         label = "  XY"
+      CASE (mask_xz)
+         label = "  XZ"
+      CASE (mask_yz)
+         label = "  YZ"
+      CASE DEFAULT
+         ! Composite constraint: spell out the fixed components
+         label = ""
+         IF (BTEST(mask, 0)) label = TRIM(label)//" AX"
+         IF (BTEST(mask, 1)) label = TRIM(label)//" BX"
+         IF (BTEST(mask, 2)) label = TRIM(label)//" BY"
+         IF (BTEST(mask, 3)) label = TRIM(label)//" CX"
+         IF (BTEST(mask, 4)) label = TRIM(label)//" CY"
+         IF (BTEST(mask, 5)) label = TRIM(label)//" CZ"
+         label = ADJUSTL(label)
+      END SELECT
+
+   END FUNCTION cell_opt_constraint_label
+
+! **************************************************************************************************
 !> \brief Computes the derivatives for the cell
 !> \param gradient ...
 !> \param av_ptens ...
@@ -244,6 +413,8 @@ CONTAINS
 
       INTEGER                                            :: i, my_constraint_id
       LOGICAL                                            :: my_keep_angles, my_keep_symmetry
+      LOGICAL, DIMENSION(3)                              :: diag_free
+      REAL(KIND=dp), DIMENSION(3)                        :: diag_ptens
       REAL(KIND=dp), DIMENSION(3, 3)                     :: correction, pten_hinv_old, ptens
 
       my_keep_angles = .FALSE.
@@ -268,22 +439,19 @@ CONTAINS
       END DO
       pres_int = pres_int/3.0_dp
 
-      SELECT CASE (my_constraint_id)
-      CASE (fix_x)
-         pres_constr = 0.5_dp*(ptens(2, 2) + ptens(3, 3))
-      CASE (fix_y)
-         pres_constr = 0.5_dp*(ptens(1, 1) + ptens(3, 3))
-      CASE (fix_z)
-         pres_constr = 0.5_dp*(ptens(1, 1) + ptens(2, 2))
-      CASE (fix_xy)
-         pres_constr = ptens(3, 3)
-      CASE (fix_xz)
-         pres_constr = ptens(2, 2)
-      CASE (fix_yz)
-         pres_constr = ptens(1, 1)
-      CASE (fix_none)
-         pres_constr = (ptens(1, 1) + ptens(2, 2) + ptens(3, 3))/3.0_dp
-      END SELECT
+      ! Nominal pressure averaged over the relaxed diagonal cell components
+      ! (AX, BY, CZ couple to the diagonal of the pressure tensor). If all
+      ! diagonal components are fixed, no pressure criterion can be relaxed
+      ! and the external pressure trivially satisfies the tolerance.
+      diag_free = [.NOT. BTEST(my_constraint_id, 0), & ! AX
+                   .NOT. BTEST(my_constraint_id, 2), & ! BY
+                   .NOT. BTEST(my_constraint_id, 5)]   ! CZ
+      diag_ptens = [ptens(1, 1), ptens(2, 2), ptens(3, 3)]
+      IF (ANY(diag_free)) THEN
+         pres_constr = SUM(diag_ptens, MASK=diag_free)/COUNT(diag_free)
+      ELSE
+         pres_constr = pres_ext
+      END IF
 
       ptens(1, 1) = av_ptens(1, 1) - pres_ext
       ptens(2, 2) = av_ptens(2, 2) - pres_ext
@@ -321,6 +489,7 @@ CONTAINS
       LOGICAL, INTENT(IN)                                :: keep_angles, keep_symmetry
       INTEGER, INTENT(IN)                                :: constraint_id
 
+      INTEGER                                            :: slot
       REAL(KIND=dp)                                      :: a, a_length, ab_length, b_length, cosa, &
                                                             cosah, cosg, deriv_gamma, g, gamma, &
                                                             norm, norm_b, norm_c, sina, sinah, sing
@@ -440,25 +609,11 @@ CONTAINS
          END SELECT
       END IF
 
-      SELECT CASE (constraint_id)
-      CASE (fix_x)
-         gradient(1:2) = 0.0_dp
-         gradient(4) = 0.0_dp
-      CASE (fix_y)
-         gradient(2:3) = 0.0_dp
-         gradient(5) = 0.0_dp
-      CASE (fix_z)
-         gradient(4:6) = 0.0_dp
-      CASE (fix_xy)
-         gradient(1:5) = 0.0_dp
-      CASE (fix_xz)
-         gradient(1:2) = 0.0_dp
-         gradient(4:6) = 0.0_dp
-      CASE (fix_yz)
-         gradient(2:6) = 0.0_dp
-      CASE (fix_none)
-         ! Nothing to do
-      END SELECT
+      ! Zero the gradient of all components fixed by the constraint mask
+      ! (comp_ax ... comp_cz, applied after the projections above)
+      DO slot = 1, 6
+         IF (BTEST(constraint_id, slot - 1)) gradient(slot) = 0.0_dp
+      END DO
 
    END SUBROUTINE apply_cell_constraints
 
