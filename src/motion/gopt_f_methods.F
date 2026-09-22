@@ -1148,7 +1148,7 @@ CONTAINS
       TYPE(force_env_type), POINTER                      :: force_env
       TYPE(section_vals_type), POINTER                   :: motion_section, root_section
 
-      CHARACTER(LEN=63)                                  :: constraint_label
+      CHARACTER(LEN=default_string_length)               :: constraint_label
       LOGICAL                                            :: keep_angles, keep_symmetry, keep_volume
       REAL(KIND=dp)                                      :: etot
       TYPE(cell_type), POINTER                           :: cell

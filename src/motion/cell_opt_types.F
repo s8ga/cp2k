@@ -85,7 +85,7 @@ CONTAINS
       TYPE(force_env_type), POINTER                      :: force_env
       TYPE(section_vals_type), POINTER                   :: geo_section
 
-      CHARACTER(LEN=63)                                  :: label
+      CHARACTER(LEN=default_string_length)               :: label
       CHARACTER(LEN=default_string_length), &
          DIMENSION(:), POINTER                           :: constraint_tokens
       INTEGER                                            :: output_unit

@@ -246,6 +246,7 @@ CONTAINS
 !> \param cell simulation cell (only the periodicity is used)
 !> \param explicit whether the CONSTRAINT keyword was given explicitly
 !> \param mask union of the fixed cell components (comp_* and mask_* bits)
+!> \author s8ga (2026)
 ! **************************************************************************************************
    SUBROUTINE parse_cell_constraint(constraint_tokens, cell, explicit, mask)
       CHARACTER(LEN=default_string_length), &
@@ -268,6 +269,10 @@ CONTAINS
       DO i = 1, SIZE(constraint_tokens)
          token = TRIM(ADJUSTL(constraint_tokens(i)))
          CALL uppercase(token)
+         IF (LEN_TRIM(token) == 0) THEN
+            CALL cp_abort(__LOCATION__, &
+                          "CELL_OPT CONSTRAINT requires a value.")
+         END IF
          IF (token == "NONE") THEN
             IF (SIZE(constraint_tokens) > 1) THEN
                CALL cp_abort(__LOCATION__, &
@@ -315,7 +320,8 @@ CONTAINS
          IF (IAND(tok_mask, mask) /= 0) THEN
             CALL cp_warn(__LOCATION__, &
                          "Redundant CELL_OPT CONSTRAINT token: "//TRIM(token)// &
-                         " (components already constrained).")
+                         " (already constrained: "// &
+                         TRIM(ADJUSTL(cell_opt_constraint_label(IAND(tok_mask, mask))))//").")
          END IF
          mask = IOR(mask, tok_mask)
       END DO
@@ -351,10 +357,11 @@ CONTAINS
 !> \return the historical four-character labels ("   X", "  XY", "NONE") for
 !>         the legacy constraint values (padded for backward compatible
 !>         printing), the fixed components spelled out ("AX BX BY") otherwise
+!> \author s8ga (2026)
 ! **************************************************************************************************
    PURE FUNCTION cell_opt_constraint_label(mask) RESULT(label)
       INTEGER, INTENT(IN)                                :: mask
-      CHARACTER(LEN=63)                                  :: label
+      CHARACTER(LEN=default_string_length)               :: label
 
       SELECT CASE (mask)
       CASE (fix_none)
