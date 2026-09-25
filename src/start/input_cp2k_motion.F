@@ -1090,7 +1090,7 @@ CONTAINS
          "NONE must stand alone, redundant tokens give a warning, and angle constraints "// &
          "(ALPHA, BETA, GAMMA) are not supported yet.", &
          usage="CONSTRAINT {NONE} | ({A|B|C|X|Y|Z|XY|XZ|YZ|AX|BX|BY|CX|CY|CZ} ...)", &
-         type_of_var=char_t, n_var=-1, default_c_val="NONE")
+         type_of_var=lchar_t, default_lc_val="NONE")
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 

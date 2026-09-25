@@ -31,7 +31,8 @@ MODULE cell_opt_types
                                               force_env_type
    USE input_constants,                 ONLY: fix_none
    USE input_section_types,             ONLY: section_vals_type,&
-                                              section_vals_val_get
+                                              section_vals_val_get,&
+                                              section_vals_val_set
    USE kinds,                           ONLY: default_string_length,&
                                               dp
 #include "../base/base_uses.f90"
@@ -85,9 +86,7 @@ CONTAINS
       TYPE(force_env_type), POINTER                      :: force_env
       TYPE(section_vals_type), POINTER                   :: geo_section
 
-      CHARACTER(LEN=default_string_length)               :: label
-      CHARACTER(LEN=default_string_length), &
-         DIMENSION(:), POINTER                           :: constraint_tokens
+      CHARACTER(LEN=default_string_length)               :: constraint_string, label
       INTEGER                                            :: output_unit
       LOGICAL                                            :: bad_constraint, constraint_explicit, &
                                                             partial_bc
@@ -108,9 +107,14 @@ CONTAINS
       CALL section_vals_val_get(geo_section, "KEEP_SYMMETRY", l_val=cell_env%keep_symmetry)
       CALL section_vals_val_get(geo_section, "PRESSURE_TOLERANCE", r_val=cell_env%pres_tol)
       CALL section_vals_val_get(geo_section, "CONSTRAINT", &
-                                c_vals=constraint_tokens, explicit=constraint_explicit)
-      CALL parse_cell_constraint(constraint_tokens, cell, constraint_explicit, &
+                                c_val=constraint_string, explicit=constraint_explicit)
+      CALL parse_cell_constraint(constraint_string, cell, constraint_explicit, &
                                  cell_env%constraint_id)
+      ! Canonicalize the echoed value so restart files record the effective
+      ! constraint instead of the user's spelling (case and token order).
+      CALL section_vals_val_set(geo_section, "CONSTRAINT", &
+                                c_val=TRIM(ADJUSTL( &
+                                           cell_opt_constraint_label(cell_env%constraint_id))))
 
       ! Reject CONSTRAINT combinations that would silently corrupt the
       ! KEEP_ANGLES projection or the KEEP_SYMMETRY symmetrization

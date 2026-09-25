@@ -242,39 +242,51 @@ CONTAINS
 
 ! **************************************************************************************************
 !> \brief Parses the tokens of the CONSTRAINT keyword into a cell component mask
-!> \param constraint_tokens tokens of the CONSTRAINT keyword (n_var=-1 string)
+!> \param constraint_string value line of the CONSTRAINT keyword (lchar_t string)
 !> \param cell simulation cell (only the periodicity is used)
 !> \param explicit whether the CONSTRAINT keyword was given explicitly
 !> \param mask union of the fixed cell components (comp_* and mask_* bits)
 !> \author s8ga (2026)
 ! **************************************************************************************************
-   SUBROUTINE parse_cell_constraint(constraint_tokens, cell, explicit, mask)
-      CHARACTER(LEN=default_string_length), &
-         DIMENSION(:), POINTER                           :: constraint_tokens
+   SUBROUTINE parse_cell_constraint(constraint_string, cell, explicit, mask)
+      CHARACTER(LEN=*), INTENT(IN)                       :: constraint_string
       TYPE(cell_type), POINTER                           :: cell
       LOGICAL, INTENT(IN)                                :: explicit
       INTEGER, INTENT(OUT)                               :: mask
 
       CHARACTER(LEN=default_string_length)               :: token
-      INTEGER                                            :: i, nonperiodic_axis, required_mask, &
-                                                            tok_mask
+      CHARACTER(LEN=LEN(constraint_string))              :: line
+      INTEGER                                            :: isep, n_tokens, nonperiodic_axis, &
+                                                            required_mask, tok_mask
 
-      CPASSERT(ASSOCIATED(constraint_tokens))
-      IF (SIZE(constraint_tokens) > 16) THEN
-         CALL cp_abort(__LOCATION__, &
-                       "CELL_OPT CONSTRAINT accepts at most 16 tokens.")
+      line = ADJUSTL(constraint_string)
+      ! Accept a fully quoted value and strip the outer quotes.
+      IF (LEN_TRIM(line) > 1) THEN
+         IF ((line(1:1) == '"' .AND. line(LEN_TRIM(line):LEN_TRIM(line)) == '"') .OR. &
+             (line(1:1) == "'" .AND. line(LEN_TRIM(line):LEN_TRIM(line)) == "'")) THEN
+            line = ADJUSTL(line(2:LEN_TRIM(line) - 1))
+         END IF
       END IF
 
       mask = 0
-      DO i = 1, SIZE(constraint_tokens)
-         token = TRIM(ADJUSTL(constraint_tokens(i)))
-         CALL uppercase(token)
-         IF (LEN_TRIM(token) == 0) THEN
-            CALL cp_abort(__LOCATION__, &
-                          "CELL_OPT CONSTRAINT requires a value.")
+      n_tokens = 0
+      DO WHILE (LEN_TRIM(line) > 0)
+         isep = SCAN(line, " "//ACHAR(9))
+         IF (isep == 0) THEN
+            token = TRIM(line)
+            line = ""
+         ELSE
+            token = TRIM(line(:isep - 1))
+            line = ADJUSTL(line(isep + 1:))
          END IF
+         n_tokens = n_tokens + 1
+         IF (n_tokens > 16) THEN
+            CALL cp_abort(__LOCATION__, &
+                          "CELL_OPT CONSTRAINT accepts at most 16 tokens.")
+         END IF
+         CALL uppercase(token)
          IF (token == "NONE") THEN
-            IF (SIZE(constraint_tokens) > 1) THEN
+            IF (LEN_TRIM(line) > 0 .OR. mask /= 0) THEN
                CALL cp_abort(__LOCATION__, &
                              "CELL_OPT CONSTRAINT NONE cannot be combined "// &
                              "with other tokens.")
@@ -325,6 +337,10 @@ CONTAINS
          END IF
          mask = IOR(mask, tok_mask)
       END DO
+      IF (n_tokens == 0) THEN
+         CALL cp_abort(__LOCATION__, &
+                       "CELL_OPT CONSTRAINT requires a value.")
+      END IF
 
       ! For 2D periodicity the non-periodic cell direction must be constrained;
       ! complete the constraint automatically if the keyword was not given
