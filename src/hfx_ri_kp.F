@@ -118,7 +118,7 @@ MODULE hfx_ri_kp
    IMPLICIT NONE
    PRIVATE
 
-   PUBLIC :: hfx_ri_update_ks_kp, hfx_ri_update_forces_kp
+   PUBLIC :: hfx_ri_update_ks_kp, hfx_ri_update_forces_kp, get_kp_and_ri_images
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'hfx_ri_kp'
 CONTAINS

@@ -506,6 +506,15 @@ CONTAINS
       ALLOCATE (sizes_RI(natom), sizes_AO(natom))
       ALLOCATE (basis_set_RI(nkind), basis_set_AO(nkind))
       CALL basis_set_list_setup(basis_set_RI, ri_data%ri_basis_type, qs_kind_set)
+      DO ibasis = 1, SIZE(basis_set_RI)
+         ri_basis => basis_set_RI(ibasis)%gto_basis_set
+         IF (INDEX(ri_basis%name, "RI-AUX-PARI") > 0) THEN
+            CALL cp_abort(__LOCATION__, "The automatically generated PARI auxiliary basis "// &
+                          "(AUTO_BASIS RI_HFX_PARI) is intentionally redundant and requires "// &
+                          "the pair atomic domain RI contraction, which is not yet available. "// &
+                          "Use AUTO_BASIS RI_HFX or an explicit BASIS_SET RI_HFX instead.")
+         END IF
+      END DO
       CALL get_particle_set(particle_set, qs_kind_set, nsgf=sizes_RI, basis=basis_set_RI)
       CALL basis_set_list_setup(basis_set_AO, ri_data%orb_basis_type, qs_kind_set)
       CALL get_particle_set(particle_set, qs_kind_set, nsgf=sizes_AO, basis=basis_set_AO)

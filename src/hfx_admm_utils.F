@@ -65,6 +65,7 @@ MODULE hfx_admm_utils
                                               hfx_ri_update_ks
    USE hfx_ri_kp,                       ONLY: hfx_ri_update_forces_kp,&
                                               hfx_ri_update_ks_kp
+   USE hfx_ri_kp_pari,                  ONLY: hfx_ri_update_ks_kp_pari
    USE hfx_types,                       ONLY: hfx_type
    USE input_constants,                 ONLY: &
         do_admm_aux_exch_func_bee, do_admm_aux_exch_func_bee_libxc, do_admm_aux_exch_func_default, &
@@ -74,6 +75,7 @@ MODULE hfx_admm_utils
         do_admm_basis_projection, do_admm_charge_constrained_projection, do_admm_purify_none, &
         do_potential_coulomb, do_potential_id, do_potential_long, do_potential_mix_cl, &
         do_potential_mix_cl_trunc, do_potential_short, do_potential_truncated, &
+        hfx_ri_kp_method_pari, &
         xc_funct_no_shortcut, xc_none
    USE input_section_types,             ONLY: section_vals_duplicate,&
                                               section_vals_get,&
@@ -1088,11 +1090,20 @@ CONTAINS
             CPABORT("Only RI-HFX is implemented for K-points")
          END IF
 
-         CALL hfx_ri_update_ks_kp(qs_env, x_data(irep, 1)%ri_data, matrix_ks_orb, ehfx, &
-                                  rho_ao_orb, s_mstruct_changed, nspins, &
-                                  x_data(irep, 1)%general_parameter%fraction)
+         IF (x_data(irep, 1)%ri_data%kp_method == hfx_ri_kp_method_pari) THEN
+            CALL hfx_ri_update_ks_kp_pari(qs_env, x_data(irep, 1)%ri_data, matrix_ks_orb, ehfx, &
+                                          rho_ao_orb, s_mstruct_changed, nspins, &
+                                          x_data(irep, 1)%general_parameter%fraction)
+         ELSE
+            CALL hfx_ri_update_ks_kp(qs_env, x_data(irep, 1)%ri_data, matrix_ks_orb, ehfx, &
+                                     rho_ao_orb, s_mstruct_changed, nspins, &
+                                     x_data(irep, 1)%general_parameter%fraction)
+         END IF
 
          IF (calculate_forces) THEN
+            IF (x_data(irep, 1)%ri_data%kp_method == hfx_ri_kp_method_pari) THEN
+               CPABORT("Forces are not yet implemented for RI%KP_METHOD PARI")
+            END IF
             !Scale auxiliary density matrix for ADMMP (see Merlot2014) with gsi(ispin) to scale force
             IF (dft_control%do_admm) THEN
                CALL scale_dm(qs_env, rho_ao_orb, scale_back=.FALSE.)

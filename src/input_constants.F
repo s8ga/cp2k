@@ -883,6 +883,10 @@ MODULE input_constants
                                                hfx_ri_do_2c_diag = 2, &
                                                hfx_ri_do_2c_cholesky = 3
 
+   ! HFX RI k-point contraction methods
+   INTEGER, PARAMETER, PUBLIC               :: hfx_ri_kp_method_global = 1, &
+                                               hfx_ri_kp_method_pari = 2
+
    INTEGER, PARAMETER, PUBLIC               :: hfx_library_is_libint = 1, &
                                                hfx_library_is_libGint = 2, &
                                                hfx_library_is_both = 12

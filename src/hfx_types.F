@@ -431,6 +431,17 @@ MODULE hfx_types
       ! 2c tensor in matrix format for K-points RI-HFX
       TYPE(dbcsr_type), DIMENSION(:, :), ALLOCATABLE  :: kp_mat_2c_pot
 
+      ! PARI k-point method (RI%KP_METHOD): replicated per-image (P_i^0|Q_j^b) metric
+      ! and the pooled pair-domain fit coefficients C3 (pre-SCF layer, geometry-dependent;
+      ! C3(i,j,b) holds coefficients on aux(i) rows for products of own atom i and atom j^b)
+      INTEGER :: kp_method = 0
+      INTEGER :: pari_npair = 0, pari_nimg = 0
+      REAL(KIND=dp) :: pari_rcond_max = 0.0_dp
+      TYPE(dbcsr_type), DIMENSION(:), ALLOCATABLE :: pari_mat_2c
+      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE :: pari_c3
+      INTEGER, DIMENSION(:), ALLOCATABLE :: pari_c3_offset, pari_pair_i, pari_pair_j, &
+                                            pari_pair_img, pari_nrow_i
+
       ! 2c tensor in (RI | RI) format for contraction
       TYPE(dbt_type), DIMENSION(:, :), ALLOCATABLE    :: t_2c_int
 
@@ -1251,6 +1262,7 @@ CONTAINS
       CALL section_vals_val_get(ri_section, "EPS_LANCZOS", r_val=ri_data%eps_lanczos)
       CALL section_vals_val_get(ri_section, "MAX_ITER_LANCZOS", i_val=ri_data%max_iter_lanczos)
       CALL section_vals_val_get(ri_section, "RI_FLAVOR", i_val=ri_data%flavor)
+      CALL section_vals_val_get(ri_section, "KP_METHOD", i_val=ri_data%kp_method)
       CALL section_vals_val_get(ri_section, "EPS_PGF_ORB", r_val=ri_data%eps_pgf_orb)
       CALL section_vals_val_get(ri_section, "MIN_BLOCK_SIZE", i_val=ri_data%min_bsize)
       CALL section_vals_val_get(ri_section, "MAX_BLOCK_SIZE_MO", i_val=ri_data%max_bsize_MO)
@@ -1690,6 +1702,19 @@ CONTAINS
          END DO
          DEALLOCATE (ri_data%kp_mat_2c_pot)
       END IF
+
+      IF (ALLOCATED(ri_data%pari_mat_2c)) THEN
+         DO i = 1, SIZE(ri_data%pari_mat_2c)
+            CALL dbcsr_release(ri_data%pari_mat_2c(i))
+         END DO
+         DEALLOCATE (ri_data%pari_mat_2c)
+      END IF
+      IF (ALLOCATED(ri_data%pari_c3)) DEALLOCATE (ri_data%pari_c3)
+      IF (ALLOCATED(ri_data%pari_c3_offset)) DEALLOCATE (ri_data%pari_c3_offset)
+      IF (ALLOCATED(ri_data%pari_pair_i)) DEALLOCATE (ri_data%pari_pair_i)
+      IF (ALLOCATED(ri_data%pari_pair_j)) DEALLOCATE (ri_data%pari_pair_j)
+      IF (ALLOCATED(ri_data%pari_pair_img)) DEALLOCATE (ri_data%pari_pair_img)
+      IF (ALLOCATED(ri_data%pari_nrow_i)) DEALLOCATE (ri_data%pari_nrow_i)
 
       IF (ALLOCATED(ri_data%kp_t_3c_int)) THEN
          DO i = 1, SIZE(ri_data%kp_t_3c_int)

@@ -21,6 +21,7 @@ MODULE qs_environment
    USE atom_kind_orbitals,              ONLY: calculate_atomic_relkin
    USE atomic_kind_types,               ONLY: atomic_kind_type
    USE auto_basis,                      ONLY: create_lri_aux_basis_set,&
+                                              create_pari_aux_basis_set,&
                                               create_ri_aux_basis_set
    USE basis_set_container_types,       ONLY: add_basis_set_to_container
    USE basis_set_types,                 ONLY: basis_sort_zet,&
@@ -92,7 +93,8 @@ MODULE qs_environment
         dispersion_d3bj, do_et_ddapc, do_method_am1, do_method_dftb, do_method_gapw, &
         do_method_gapw_xc, do_method_gpw, do_method_lrigpw, do_method_mndo, do_method_mndod, &
         do_method_ofgpw, do_method_pdg, do_method_pm3, do_method_pm6, do_method_pm6fm, &
-        do_method_pnnl, do_method_rigpw, do_method_rm1, do_method_xtb, do_qmmm_gauss, &
+        do_method_pnnl, do_method_rigpw, do_method_rm1, do_method_xtb, do_potential_coulomb, &
+        do_potential_short, do_qmmm_gauss, &
         do_qmmm_swave, do_spin_density, general_roks, gfn1xtb, hden_atomic, kg_tnadd_embed_ri, &
         linear_response_run, mtlr_atomic_perturbations, mtlr_reference_from_atomic, &
         mtlr_reference_from_restart, rel_none, rel_trans_atom, restart_guess, sic_none, &
@@ -110,6 +112,7 @@ MODULE qs_environment
    USE kg_environment,                  ONLY: kg_env_create
    USE kinds,                           ONLY: default_string_length,&
                                               dp
+   USE libint_2c_3c,                    ONLY: libint_potential_type
    USE kpoint_methods,                  ONLY: kpoint_env_initialize,&
                                               kpoint_initialize,&
                                               kpoint_initialize_mos
@@ -1116,8 +1119,8 @@ CONTAINS
       LOGICAL :: all_potential_present, be_silent, cneo_potential_present, do_kpoints, do_ri_hfx, &
          do_ri_mp2, do_ri_rpa, do_ri_sos_mp2, do_rpa_ri_exx, do_wfc_im_time, e1terms, &
          has_unit_metric, lribas, mp2_present, orb_gradient, paw_atom
-      REAL(KIND=dp)                                      :: alpha, ccore, ewald_rcut, fxx, maxocc, &
-                                                            rc, rcut, total_zeff_corr, &
+      REAL(KIND=dp)                                      :: alpha, ccore, eps_pari, ewald_rcut, fxx, &
+                                                            maxocc, rc, rcut, total_zeff_corr, &
                                                             verlet_skin, zeff_correction
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cp_logger_type), POINTER                      :: logger
@@ -1133,6 +1136,7 @@ CONTAINS
                                                             ri_hfx_basis, ri_xas_basis, &
                                                             tmp_basis_set
       TYPE(harris_type), POINTER                         :: harris_env
+      TYPE(libint_potential_type)                         :: pari_potential
       TYPE(local_rho_type), POINTER                      :: local_rho_set
       TYPE(lri_environment_type), POINTER                :: lri_env
       TYPE(mo_set_type), DIMENSION(:), POINTER           :: mos, mos_last_converged
@@ -1509,6 +1513,29 @@ CONTAINS
       IF (do_ri_hfx .OR. do_rpa_ri_exx) THEN
          CALL get_qs_env(qs_env, nkind=nkind)
          CALL section_vals_val_get(qs_env%input, "DFT%SORT_BASIS", i_val=sort_basis)
+         IF (do_ri_hfx .AND. dft_control%auto_basis_ri_hfx_pari >= 0) THEN
+            ! metric operator and PCA threshold for the PARI auto basis
+            CALL section_vals_val_get(qs_env%input, "DFT%XC%HF%INTERACTION_POTENTIAL%POTENTIAL_TYPE", &
+                                      i_val=my_ival)
+            pari_potential%potential_type = my_ival
+            CALL section_vals_val_get(qs_env%input, "DFT%XC%HF%INTERACTION_POTENTIAL%OMEGA", &
+                                      r_val=eps_pari)
+            pari_potential%omega = eps_pari
+            IF (pari_potential%potential_type /= do_potential_coulomb .AND. &
+                pari_potential%potential_type /= do_potential_short) THEN
+               CALL cp_abort(__LOCATION__, "AUTO_BASIS RI_HFX_PARI is only implemented for "// &
+                             "COULOMB and SHORTRANGE interaction potentials")
+            END IF
+            ! the cutoff radius enters the two-center engine only as a screening range,
+            ! which is inert for the same-center integrals of the PCA
+            pari_potential%cutoff_radius = 1.0E10_dp
+            CALL section_vals_val_get(qs_env%input, "DFT%XC%HF%RI%PARI_EPS_PCA", r_val=eps_pari)
+            IF (eps_pari <= 0.0_dp) THEN
+               CALL cp_abort(__LOCATION__, "RI%PARI_EPS_PCA must be positive: negative values once "// &
+                             "switched off the PCA span deflation and now silently keep every product "// &
+                             "function (threshold compared with sign).")
+            END IF
+         END IF
          DO ikind = 1, nkind
             NULLIFY (ri_hfx_basis)
             qs_kind => qs_kind_set(ikind)
@@ -1516,7 +1543,19 @@ CONTAINS
                              basis_type="RI_HFX")
             IF (.NOT. (ASSOCIATED(ri_hfx_basis))) THEN
                CALL get_qs_kind_set(qs_kind_set, maxlgto=maxlgto)
-               IF (dft_control%do_admm) THEN
+               IF (do_ri_hfx .AND. dft_control%auto_basis_ri_hfx_pari >= 0) THEN
+                  IF (dft_control%do_admm) THEN
+                     CALL create_pari_aux_basis_set(ri_hfx_basis, qs_kind, &
+                                                    dft_control%auto_basis_ri_hfx_pari, &
+                                                    basis_type="AUX_FIT", basis_sort=sort_basis, &
+                                                    potential_parameter=pari_potential, eps_pca=eps_pari)
+                  ELSE
+                     CALL create_pari_aux_basis_set(ri_hfx_basis, qs_kind, &
+                                                    dft_control%auto_basis_ri_hfx_pari, &
+                                                    basis_sort=sort_basis, &
+                                                    potential_parameter=pari_potential, eps_pca=eps_pari)
+                  END IF
+               ELSE IF (dft_control%do_admm) THEN
                   CALL create_ri_aux_basis_set(ri_hfx_basis, qs_kind, dft_control%auto_basis_ri_hfx, &
                                                basis_type="AUX_FIT", basis_sort=sort_basis)
                ELSE

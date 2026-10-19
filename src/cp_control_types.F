@@ -818,6 +818,7 @@ MODULE cp_control_types
                                               auto_basis_ri_hxc = 1, &
                                               auto_basis_ri_xas = 1, &
                                               auto_basis_ri_hfx = 1, &
+                                              auto_basis_ri_hfx_pari = -1, &
                                               localize_each = 1, &
                                               mtlr_ikind = 1, &
                                               mtlr_initialization_mode = mtlr_initialization_unresolved, &

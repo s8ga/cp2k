@@ -270,6 +270,7 @@ list(
   hfx_pw_methods.F
   hfx_ri.F
   hfx_ri_kp.F
+  hfx_ri_kp_pari.F
   hfx_screening_methods.F
   hfx_types.F
   hirshfeld_methods.F

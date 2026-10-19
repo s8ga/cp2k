@@ -13,22 +13,36 @@
 !> - 11.2017 creation [JGH]
 ! **************************************************************************************************
 MODULE auto_basis
-   USE aux_basis_set,                   ONLY: create_aux_basis
-   USE basis_set_types,                 ONLY: get_gto_basis_set,&
+   USE ai_contraction_sphi,           ONLY: ab_contract
+   USE aux_basis_set,                 ONLY: create_aux_basis
+   USE basis_set_types,               ONLY: combine_basis_sets,&
+                                              deallocate_gto_basis_set,&
+                                              get_gto_basis_set,&
                                               gto_basis_set_type,&
+                                              init_orb_basis_set,&
                                               sort_gto_basis_set
-   USE bibliography,                    ONLY: Stoychev2016,&
+   USE bibliography,                  ONLY: Stoychev2016,&
                                               cite_reference
-   USE kinds,                           ONLY: default_string_length,&
+   USE gamma,                         ONLY: init_md_ftable
+   USE kinds,                         ONLY: default_string_length,&
                                               dp
-   USE mathconstants,                   ONLY: dfac,&
+   USE libint_2c_3c,                  ONLY: eri_2center,&
+                                              libint_potential_type
+   USE libint_wrapper,                ONLY: cp_libint_cleanup_2eri,&
+                                              cp_libint_init_2eri,&
+                                              cp_libint_set_contrdepth,&
+                                              cp_libint_t
+   USE mathconstants,                 ONLY: dfac,&
                                               fac,&
                                               gamma1,&
                                               pi,&
                                               rootpi
-   USE orbital_pointers,                ONLY: init_orbital_pointers
-   USE periodic_table,                  ONLY: get_ptable_info
-   USE qs_kind_types,                   ONLY: get_qs_kind,&
+   USE orbital_pointers,              ONLY: init_orbital_pointers,&
+                                              nco,&
+                                              ncoset,&
+                                              nso
+   USE periodic_table,                ONLY: get_ptable_info
+   USE qs_kind_types,                 ONLY: get_qs_kind,&
                                               qs_kind_type
 #include "./base/base_uses.f90"
 
@@ -39,7 +53,7 @@ MODULE auto_basis
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'auto_basis'
 
    PUBLIC :: create_ri_aux_basis_set, create_lri_aux_basis_set, &
-             create_oce_basis
+             create_oce_basis, create_pari_aux_basis_set
 
 CONTAINS
 
@@ -227,6 +241,323 @@ CONTAINS
       END IF
 
    END SUBROUTINE create_ri_aux_basis_set
+! **************************************************************************************************
+!> \brief Create a RI basis set for pair atomic domain RI (PARI): the tempered RI_AUX
+!>        basis combined with same-center Gaussian-product functions of the ORB basis,
+!>        selected by principal component analysis (PCA) of the two-center metric. The
+!>        rotationally invariant metric is block diagonal in the total angular momentum,
+!>        so the PCA factorizes into small radial eigenproblems, one per angular
+!>        momentum. Radial eigenvectors with eigenvalues above eps_pca times the largest
+!>        eigenvalue are kept as contracted shells of pure angular momentum.
+!> \param ri_aux_basis_set ...
+!> \param qs_kind ...
+!> \param basis_cntrl ...
+!> \param basis_type ...
+!> \param basis_sort ...
+!> \param potential_parameter two-center metric operator (e.g. short range)
+!> \param eps_pca relative PCA threshold for keeping product functions
+!> \date    10.2026
+! **************************************************************************************************
+   SUBROUTINE create_pari_aux_basis_set(ri_aux_basis_set, qs_kind, basis_cntrl, basis_type, &
+                                        basis_sort, potential_parameter, eps_pca)
+      TYPE(gto_basis_set_type), POINTER                  :: ri_aux_basis_set
+      TYPE(qs_kind_type), INTENT(IN)                     :: qs_kind
+      INTEGER, INTENT(IN)                                :: basis_cntrl
+      CHARACTER(LEN=*), INTENT(IN), OPTIONAL             :: basis_type
+      INTEGER, INTENT(IN), OPTIONAL                      :: basis_sort
+      TYPE(libint_potential_type), INTENT(IN)            :: potential_parameter
+      REAL(KIND=dp), INTENT(IN)                          :: eps_pca
+
+      CHARACTER(LEN=2)                                   :: element_symbol
+      CHARACTER(LEN=512)                                 :: error_msg
+      CHARACTER(LEN=default_string_length)               :: bsname
+      CHARACTER(len=*), PARAMETER                        :: routineN = 'create_pari_aux_basis_set'
+
+      INTEGER :: handle, i, iL, info, ii, iOrbSet, iOrbSh, ipgf, iset, ishell, isgf0, j, &
+                 jOrbSet, jOrbSh, k, kL, la, lb, lmax_orb, ll, Ltot, m, m0, maxL, maxne, &
+                 msum, ne, nkeep_tot, nsetF, nsetL, nset_o, nshell_tot, nsoL, ntot
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: kepF, kepL, keep_idx, Llist, ls1, &
+                                                            ls1_f, ls2, ls2_f, neL, npgf_b, &
+                                                            npgf_f, sh_l, sh_set
+      INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: nl_b, nl_f
+      REAL(KIND=dp)                                      :: eval_max, scal, xtmp
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: evals, rpgf0, sums, work
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: ev_all, exp_all, gpp, gsph, sij, &
+                                                            sph, zet_b, zet_f
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: vec_all
+      REAL(KIND=dp), DIMENSION(3)                        :: r0
+      TYPE(cp_libint_t)                                  :: lib
+      TYPE(gto_basis_set_type), POINTER                  :: boot_basis, orb_basis_set, &
+                                                            pca_basis, tempered
+
+! -------------------------------------------------------------------------
+
+      CALL timeset(routineN, handle)
+      CPASSERT(.NOT. ASSOCIATED(ri_aux_basis_set))
+      NULLIFY (tempered, orb_basis_set, pca_basis, boot_basis)
+      r0 = 0.0_dp
+
+      ! tempered part: identical to the RI_HFX auto basis
+      CALL create_ri_aux_basis_set(tempered, qs_kind, basis_cntrl, basis_type)
+
+      ! product part: built from the ORB basis of this kind
+      CALL get_qs_kind(qs_kind, basis_set=orb_basis_set, basis_type="ORB")
+      IF (.NOT. ASSOCIATED(orb_basis_set) .OR. SUM(orb_basis_set%nsgf_set) == 0) THEN
+         IF (.NOT. ASSOCIATED(tempered)) THEN
+            CALL cp_abort(__LOCATION__, "PARI auto basis: neither ORB products nor a "// &
+                          "tempered RI basis are available for this kind")
+         END IF
+         CPWARN("PARI auto basis: no ORB basis found, falling back to the tempered basis")
+         ri_aux_basis_set => tempered
+         CALL timestop(handle)
+         RETURN
+      END IF
+
+      nset_o = orb_basis_set%nset
+      lmax_orb = MAXVAL(orb_basis_set%lmax(1:nset_o))
+      IF (2*lmax_orb > 9) THEN
+         CALL cp_abort(__LOCATION__, "PARI auto basis: ORB basis l-max too large for "// &
+                       "Gaussian-product expansion")
+      END IF
+      maxL = 2*lmax_orb
+      CALL init_orbital_pointers(maxL)
+
+      ! flatten the ORB shell list
+      nshell_tot = SUM(orb_basis_set%nshell(1:nset_o))
+      ALLOCATE (sh_set(nshell_tot), sh_l(nshell_tot))
+      k = 0
+      DO iOrbSet = 1, nset_o
+         DO iOrbSh = 1, orb_basis_set%nshell(iOrbSet)
+            k = k + 1
+            sh_set(k) = iOrbSet
+            sh_l(k) = orb_basis_set%l(iOrbSh, iOrbSet)
+         END DO
+      END DO
+
+      ! upper bound on the number of product exponents
+      ntot = 0
+      DO i = 1, nshell_tot
+         DO j = i, nshell_tot
+            ntot = ntot + orb_basis_set%npgf(sh_set(i))*orb_basis_set%npgf(sh_set(j))
+         END DO
+      END DO
+      ALLOCATE (sums(ntot), exp_all(ntot, 0:maxL))
+
+      ! distinct product exponents per total angular momentum Ltot (sorted, unique)
+      ALLOCATE (neL(0:maxL))
+      DO Ltot = 0, maxL
+         m = 0
+         DO i = 1, nshell_tot
+            la = sh_l(i)
+            DO j = i, nshell_tot
+               lb = sh_l(j)
+               IF (Ltot < ABS(la - lb) .OR. Ltot > la + lb) CYCLE
+               IF (MOD(la + lb - Ltot, 2) /= 0) CYCLE
+               DO k = 1, orb_basis_set%npgf(sh_set(i))
+                  DO ii = 1, orb_basis_set%npgf(sh_set(j))
+                     m = m + 1
+                     sums(m) = orb_basis_set%zet(k, sh_set(i)) + orb_basis_set%zet(ii, sh_set(j))
+                  END DO
+               END DO
+            END DO
+         END DO
+         ! insertion sort
+         DO i = 2, m
+            xtmp = sums(i)
+            j = i - 1
+            DO WHILE (j >= 1)
+               IF (sums(j) <= xtmp) EXIT
+               sums(j + 1) = sums(j)
+               j = j - 1
+            END DO
+            sums(j + 1) = xtmp
+         END DO
+         ! compact to unique exponents (relative tolerance)
+         msum = 0
+         DO i = 1, m
+            IF (msum == 0 .OR. sums(i) - sums(msum) > 1.0E-6_dp*sums(msum)) THEN
+               msum = msum + 1
+               sums(msum) = sums(i)
+            END IF
+         END DO
+         neL(Ltot) = msum
+         exp_all(1:msum, Ltot) = sums(1:msum)
+      END DO
+      maxne = MAXVAL(neL)
+
+      nsetL = COUNT(neL > 0)
+      CPASSERT(nsetL > 0)
+      ALLOCATE (Llist(nsetL), ls1(nsetL), ls2(nsetL), npgf_b(nsetL), kepL(nsetL))
+      ALLOCATE (zet_b(maxne, nsetL))
+      zet_b = 0.0_dp
+      k = 0
+      DO Ltot = 0, maxL
+         IF (neL(Ltot) > 0) THEN
+            k = k + 1
+            Llist(k) = Ltot
+            ls1(k) = Ltot
+            ls2(k) = Ltot
+            npgf_b(k) = neL(Ltot)
+            zet_b(1:neL(Ltot), k) = exp_all(1:neL(Ltot), Ltot)
+         END IF
+      END DO
+      DEALLOCATE (exp_all, sums)
+
+      ! bootstrap basis: one uncontracted shell per product primitive (identity gcc)
+      ALLOCATE (nl_b(0:maxL, nsetL))
+      nl_b = 0
+      DO iL = 1, nsetL
+         nl_b(Llist(iL), iL) = npgf_b(iL)
+      END DO
+      bsname = "PARI-BOOT"
+      CALL create_aux_basis(boot_basis, bsname, nsetL, ls1, ls2, nl_b, npgf_b, zet_b)
+      boot_basis%gcc = 0.0_dp
+      DO iL = 1, nsetL
+         DO i = 1, npgf_b(iL)
+            boot_basis%gcc(i, i, iL) = 1.0_dp
+         END DO
+      END DO
+      CALL init_orb_basis_set(boot_basis)
+
+      ! radial two-center metric per Ltot and its eigendecomposition
+      ALLOCATE (ev_all(maxne, nsetL), vec_all(maxne, maxne, nsetL))
+      ALLOCATE (work(64*maxne + 2))
+      eval_max = 0.0_dp
+      CALL init_md_ftable(2*maxL)
+      CALL cp_libint_init_2eri(lib, maxL)
+      CALL cp_libint_set_contrdepth(lib, 1)
+      DO iL = 1, nsetL
+         Ltot = Llist(iL)
+         ne = npgf_b(iL)
+         nsoL = nso(Ltot)
+         ii = ne*ncoset(Ltot)
+         ALLOCATE (sij(ii, ii), sph(ii, ne*nsoL), gsph(ne*nsoL, ne*nsoL), gpp(ne, ne), &
+                   evals(ne), rpgf0(ne))
+         sij = 0.0_dp
+         rpgf0 = 0.0_dp
+         CALL eri_2center(sij, Ltot, Ltot, ne, zet_b(1:ne, iL), rpgf0, r0, &
+                          Ltot, Ltot, ne, zet_b(1:ne, iL), rpgf0, r0, 0.0_dp, lib, potential_parameter)
+         isgf0 = boot_basis%first_sgf(1, iL)
+         sph = boot_basis%sphi(1:ii, isgf0:isgf0 + ne*nsoL - 1)
+         CALL ab_contract(gsph, sij, sph, sph, ii, ii, ne*nsoL, ne*nsoL)
+         ! rotationally invariant metric: any fixed m column gives the radial block
+         m0 = 1
+         DO i = 1, ne
+            DO j = 1, ne
+               gpp(i, j) = 0.5_dp*(gsph((i - 1)*nsoL + m0, (j - 1)*nsoL + m0) + &
+                                   gsph((j - 1)*nsoL + m0, (i - 1)*nsoL + m0))
+            END DO
+         END DO
+         DEALLOCATE (sij, gsph)
+         ! eigendecomposition of the product metric
+         gpp = 0.5_dp*(gpp + TRANSPOSE(gpp))
+         CALL dsyev('V', 'U', ne, gpp, ne, evals, work, SIZE(work), info)
+         CPASSERT(info == 0)
+         ev_all(1:ne, iL) = evals(:)
+         vec_all(1:ne, 1:ne, iL) = gpp(:, :)
+         eval_max = MAX(eval_max, evals(ne))
+         DEALLOCATE (sph, gpp, evals, rpgf0)
+      END DO
+      DEALLOCATE (work)
+      CALL cp_libint_cleanup_2eri(lib)
+      CALL deallocate_gto_basis_set(boot_basis)
+
+      ! PCA selection: keep radial eigenvectors above eps_pca*eval_max
+      nkeep_tot = 0
+      DO iL = 1, nsetL
+         ne = npgf_b(iL)
+         kL = COUNT(ev_all(1:ne, iL) > eps_pca*eval_max)
+         kepL(iL) = kL
+         nkeep_tot = nkeep_tot + kL*nso(Llist(iL))
+      END DO
+      IF (nkeep_tot == 0) THEN
+         WRITE (error_msg, '(A,ES9.1,A)') "PARI auto basis: no product function survived the "// &
+            "PCA threshold ", eps_pca, "; keeping the tempered basis only"
+         CPWARN(TRIM(error_msg))
+      END IF
+
+      CALL get_qs_kind(qs_kind, element_symbol=element_symbol)
+      bsname = TRIM(element_symbol)//"-RI-AUX-PARI-"//TRIM(orb_basis_set%name)
+
+      IF (nkeep_tot > 0) THEN
+         ! final PCA basis: kept eigenvectors as contracted shells;
+         ! pack only angular momenta with kepL > 0 (create_aux_basis cannot
+         ! handle sets without contracted shells)
+         nsetF = COUNT(kepL > 0)
+         ALLOCATE (keep_idx(nsetF), ls1_f(nsetF), ls2_f(nsetF), npgf_f(nsetF), kepF(nsetF))
+         ALLOCATE (nl_f(0:maxL, nsetF), zet_f(maxne, nsetF))
+         nl_f = 0
+         zet_f = 0.0_dp
+         k = 0
+         DO iL = 1, nsetL
+            IF (kepL(iL) > 0) THEN
+               k = k + 1
+               keep_idx(k) = iL
+               ls1_f(k) = ls1(iL)
+               ls2_f(k) = ls2(iL)
+               npgf_f(k) = npgf_b(iL)
+               kepF(k) = kepL(iL)
+               zet_f(1:npgf_f(k), k) = zet_b(1:npgf_b(iL), iL)
+               nl_f(Llist(iL), k) = kepF(k)
+            END IF
+         END DO
+         CALL create_aux_basis(pca_basis, bsname, nsetF, ls1_f, ls2_f, nl_f, npgf_f, zet_f)
+         DO k = 1, nsetF
+            iL = keep_idx(k)
+            ne = npgf_b(iL)
+            kL = kepL(iL)
+            DO i = 1, kL
+               pca_basis%gcc(1:ne, i, k) = vec_all(1:ne, ne - kL + i, iL)
+            END DO
+         END DO
+         DEALLOCATE (keep_idx, ls1_f, ls2_f, npgf_f, kepF, nl_f, zet_f)
+         IF (ASSOCIATED(tempered)) THEN
+            CALL combine_basis_sets(tempered, pca_basis)
+            ri_aux_basis_set => tempered
+            CALL deallocate_gto_basis_set(pca_basis)
+         ELSE
+            ri_aux_basis_set => pca_basis
+         END IF
+         ri_aux_basis_set%name = bsname
+         ri_aux_basis_set%aliases = bsname
+         WRITE (error_msg, '(A,I0,A)') "Automatic generation of PARI auxiliary basis "// &
+            "(tempered RI_AUX union on-site product PCA, experimental): added ", nkeep_tot, &
+            " product functions"
+         CPWARN(TRIM(error_msg))
+      ELSE
+         ri_aux_basis_set => tempered
+      END IF
+
+      ! Fold the primitive normalization into the emitted coefficients. The
+      ! generator works with primitives normalized as in the two-center metric
+      ! (2a)^((2l+3)/4), while the integral engine evaluates an in-memory basis
+      ! as contractions of unnormalized primitives divided by the norm_type=2
+      ! factor 2^l (2/pi)^(3/4) a^((2l+3)/4) (this is what the basis reader
+      ! compensates for file bases via init_orb_basis_set). Storing gcc times
+      ! that factor makes the runtime functions the intended (metric-orthogonal)
+      ! set, and the basis-file printer, which divides the factor back out,
+      ! emits exactly these coefficients in file convention.
+      DO iset = 1, ri_aux_basis_set%nset
+         DO ishell = 1, ri_aux_basis_set%nshell(iset)
+            ll = ri_aux_basis_set%l(ishell, iset)
+            scal = 2.0_dp**ll*(2.0_dp/pi)**0.75_dp
+            DO ipgf = 1, ri_aux_basis_set%npgf(iset)
+               ri_aux_basis_set%gcc(ipgf, ishell, iset) = scal* &
+                  ri_aux_basis_set%zet(ipgf, iset)**(0.25_dp*REAL(2*ll + 3, dp))* &
+                  ri_aux_basis_set%gcc(ipgf, ishell, iset)
+            END DO
+         END DO
+      END DO
+
+      IF (PRESENT(basis_sort)) THEN
+         CALL sort_gto_basis_set(ri_aux_basis_set, basis_sort)
+      END IF
+
+      DEALLOCATE (ev_all, kepL, Llist, ls1, ls2, neL, nl_b, npgf_b, sh_l, sh_set, vec_all, zet_b)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE create_pari_aux_basis_set
 ! **************************************************************************************************
 !> \brief Create a LRI_AUX basis set using some heuristics
 !> \param lri_aux_basis_set ...

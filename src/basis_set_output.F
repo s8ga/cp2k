@@ -27,6 +27,7 @@ MODULE basis_set_output
                                               section_vals_val_get
    USE kinds,                           ONLY: default_string_length,&
                                               dp
+   USE mathconstants,                   ONLY: pi
    USE qs_environment_types,            ONLY: get_qs_env,&
                                               qs_environment_type
    USE qs_kind_types,                   ONLY: get_qs_kind,&
@@ -166,6 +167,7 @@ CONTAINS
       INTEGER, DIMENSION(0:9)                            :: lset
       INTEGER, DIMENSION(:), POINTER                     :: lmax, lmin, npgf, nshell
       INTEGER, DIMENSION(:, :), POINTER                  :: l, n
+      REAL(KIND=dp)                                      :: norm_fac
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: zet
       REAL(KIND=dp), DIMENSION(:, :, :), POINTER         :: gcc
 
@@ -176,6 +178,12 @@ CONTAINS
                              nshell=nshell, n=n, l=l, &
                              gcc=gcc, zet=zet)
 
+      ! The basis initialisation folds the primitive normalization into gcc
+      ! (norm_type 2: normalise_gcc_orb, norm_type 1: init_norm_cgf_orb_den in
+      ! basis_set_types). Printed coefficients must carry the file convention
+      ! (contractions of normalized primitives), so the folding is undone here;
+      ! without it the emitted file does not round-trip: re-reading it applies
+      ! the folding a second time and silently changes the basis.
       WRITE (iunit, "(I5)") nset
       DO iset = 1, nset
          lset = 0
@@ -186,9 +194,33 @@ CONTAINS
          WRITE (iunit, "(I5,2I3,I5,2X,10(I3))") n(1, iset), lmin(iset), lmax(iset), npgf(iset), &
             (lset(ll), ll=lmin(iset), lmax(iset))
          DO ipgf = 1, npgf(iset)
-            WRITE (iunit, "(ES26.17E3,1X,*(ES26.17E3))") zet(ipgf, iset), (gcc(ipgf, ishell, iset), ishell=1, nshell(iset))
+            WRITE (iunit, "(ES26.17E3,1X,*(ES26.17E3))") zet(ipgf, iset), &
+               (gcc_file(ipgf, ishell, iset), ishell=1, nshell(iset))
          END DO
       END DO
+
+   CONTAINS
+
+      ! coefficients of the same runtime basis in the basis-file convention
+      PURE FUNCTION gcc_file(ipgf, ishell, iset) RESULT(cval)
+         INTEGER, INTENT(IN)                               :: ipgf, ishell, iset
+         REAL(KIND=dp)                                     :: cval
+
+         INTEGER                                            :: lsh
+         REAL(KIND=dp)                                      :: z
+
+         lsh = l(ishell, iset)
+         z = zet(ipgf, iset)
+         cval = gcc(ipgf, ishell, iset)
+         SELECT CASE (basis%norm_type)
+         CASE (2)
+            cval = cval/(2.0_dp**lsh*(2.0_dp/pi)**0.75_dp*z**(0.25_dp*REAL(2*lsh + 3, dp)))
+         CASE (1)
+            cval = cval/((1.0_dp/pi)**1.5_dp*z**(0.5_dp*REAL(2*lsh + 3, dp)))
+         CASE DEFAULT
+            ! norm_type 0 keeps gcc as-is
+         END SELECT
+      END FUNCTION gcc_file
 
    END SUBROUTINE basis_out
 

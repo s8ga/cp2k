@@ -294,8 +294,10 @@ CONTAINS
                           description="Specify type and size of automatically generated auxiliary "// &
                           "(RI) basis sets. Exactly two arguments are required for this option. "// &
                           "The first argument of basis type should be one of the following: "// &
-                          "`RI_AUX`, `AUX_FIT`, `LRI_AUX`, `P_LRI_AUX`, `RI_HXC`, `RI_XAS`, or "// &
-                          "`RI_HFX`. The second argument of basis size should be one of the "// &
+                          "`RI_AUX`, `AUX_FIT`, `LRI_AUX`, `P_LRI_AUX`, `RI_HXC`, `RI_XAS`, "// &
+                          "`RI_HFX`, or `RI_HFX_PARI` (the RI_HFX basis enriched with on-site "// &
+                          "product functions selected by principal-component analysis, for pair "// &
+                          "atomic domain RI). The second argument of basis size should be one of the "// &
                           "following: `SMALL`, `MEDIUM`, `LARGE`, or `HUGE`. The default is not "// &
                           "using any of these basis sets, requested by `AUTO_BASIS X X` (exactly "// &
                           "as written here).", &

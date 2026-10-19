@@ -23,7 +23,8 @@ MODULE input_cp2k_hfx
       do_potential_coulomb, do_potential_gaussian, do_potential_id, do_potential_long, &
       do_potential_mix_cl, do_potential_mix_cl_trunc, do_potential_mix_lg, do_potential_short, &
       do_potential_truncated, ehrenfest, gaussian, hfx_ri_do_2c_cholesky, hfx_ri_do_2c_diag, &
-      hfx_ri_do_2c_iter, hfx_library_is_both, hfx_library_is_libGint, &
+      hfx_ri_do_2c_iter, hfx_ri_kp_method_global, hfx_ri_kp_method_pari, &
+      hfx_library_is_both, hfx_library_is_libGint, &
       hfx_library_is_libint
    USE input_keyword_types, ONLY: keyword_create, &
                                   keyword_release, &
@@ -557,6 +558,19 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="PARI_EPS_PCA", &
+                          description="Threshold for the product-principal-component selection in the "// &
+                          "automatically generated PARI auxiliary basis (enabled by AUTO_BASIS "// &
+                          "RI_HFX_PARI). Eigenvectors of the on-site two-center metric in the space "// &
+                          "of same-center Gaussian products of the orbital basis are kept if their "// &
+                          "eigenvalue exceeds this threshold times the largest eigenvalue. Smaller "// &
+                          "values give larger and more accurate auxiliary bases. The union basis is "// &
+                          "intentionally redundant (tempered plus product functions) and requires "// &
+                          "the pair-domain PARI contraction. Default should be kept.", &
+                          default_r_val=1.0E-3_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="OMEGA", &
                           description="The range parameter for the short range operator (in 1/a0). "// &
                           "Default is OMEGA from INTERACTION_POTENTIAL. ", &
@@ -738,6 +752,19 @@ CONTAINS
                           enum_desc=s2a("with MO coefficients", "with density matrix"), &
                           enum_i_vals=[ri_mo, ri_pmat], &
                           default_i_val=ri_pmat)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="KP_METHOD", &
+                          description="Contraction scheme for k-point RI-HFX. GLOBAL uses the global RI metric "// &
+                          "inverse over image-extended atomic domains, PARI uses pair atomic domain RI "// &
+                          "(JPCL 2020, 10.1021/acs.jpclett.0c00481) with a truncated per-pair metric "// &
+                          "pseudo-inverse, for which the AUTO_BASIS RI_HFX_PARI auxiliary basis is required.", &
+                          enum_c_vals=s2a("GLOBAL", "PARI"), &
+                          enum_desc=s2a("global RI metric inverse (default)", &
+                                        "pair atomic domain RI (localized domains)"), &
+                          enum_i_vals=[hfx_ri_kp_method_global, hfx_ri_kp_method_pari], &
+                          default_i_val=hfx_ri_kp_method_global)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
