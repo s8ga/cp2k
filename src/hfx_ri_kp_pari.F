@@ -28,8 +28,9 @@ MODULE hfx_ri_kp_pari
                                               dbcsr_distribution_type, dbcsr_get_block_p, &
                                               dbcsr_iterator_blocks_left, dbcsr_iterator_next_block, &
                                               dbcsr_iterator_start, dbcsr_iterator_stop, &
-                                              dbcsr_iterator_type, dbcsr_p_type, dbcsr_release, &
-                                              dbcsr_replicate_all, dbcsr_type, dbcsr_type_no_symmetry
+                                              dbcsr_iterator_type, dbcsr_p_type, dbcsr_put_block, &
+                                              dbcsr_release, dbcsr_replicate_all, dbcsr_type, &
+                                              dbcsr_type_no_symmetry
    USE cp_dbcsr_operations,             ONLY: cp_dbcsr_dist2d_to_dist
    USE dbt_api,                          ONLY: dbt_create, dbt_destroy, dbt_distribution_destroy, &
                                               dbt_distribution_new, dbt_distribution_type, &
@@ -42,9 +43,10 @@ MODULE hfx_ri_kp_pari
    USE input_cp2k_hfx,                   ONLY: ri_pmat
    USE kinds,                            ONLY: dp
    USE kpoint_types,                     ONLY: get_kpoint_info, kpoint_type
-   USE machine,                          ONLY: m_flush
+   USE machine,                          ONLY: m_flush, m_walltime
    USE mathlib,                          ONLY: get_pseudo_inverse_diag
    USE message_passing,                  ONLY: mp_cart_type, mp_para_env_type
+!$ USE OMP_LIB,                          ONLY: omp_get_max_threads, omp_get_thread_num
    USE particle_types,                   ONLY: particle_type
    USE qs_environment_types,            ONLY: get_qs_env, qs_environment_type
    USE qs_integral_utils,               ONLY: basis_set_list_setup
@@ -63,11 +65,34 @@ MODULE hfx_ri_kp_pari
 
    CHARACTER(LEN=*), PARAMETER, PRIVATE :: moduleN = 'hfx_ri_kp_pari'
 
-   ! relative eigenvalue threshold of the per-pair truncated pseudo-inverse,
-   ! oracle-calibrated (PHASE2_SLICE2B appendix 10: pair-domain condition numbers
-   ! ~1e10 for Si union bases; the exchange matrix is insensitive for thresholds
-   ! anywhere in [1e-8, no truncation])
-   REAL(KIND=dp), PARAMETER, PRIVATE :: pari_eps_eig = 1.0E-10_dp
+   ! relative eigenvalue threshold of the per-pair truncated pseudo-inverse.
+   ! TODO(dev experiment): the appendix-10 insensitivity calibration predates the
+   ! storage-parity fix and is overturned by the regularization-path A/B; testing
+   ! the solve-side truncation directly
+   REAL(KIND=dp), PRIVATE :: pari_eps_eig = 3.0E-3_dp
+   ! TODO(dev experiment, remove before PR): per-term ablation switch (bit 1=T1, 2=T2, 4=T3, 8=T4)
+   INTEGER, PRIVATE :: pari_term_mask = 15
+   ! TODO(dev experiment, remove before PR): image-index L1 cutoff knobs. The
+   ! round-16 verdict: gating by image INDEX (not by physical content) breaks
+   ! the Gram structure of the exchange operator -- truncating V blocks or
+   ! gating T4 alone loses positive semidefiniteness and the T1<->T4 adjoint
+   ! pair, which amplified a 3% step-1 error into a 6000x step-2 explosion on
+   ! hBN4 (2D diagonal images at 3.5 A carry live content at L1=2). Defaults
+   ! below are OFF (=99, no image is cut); writing 2/3/3 into the knob files
+   ! restores the legacy gated behavior for A/B attribution and cost runs
+   INTEGER, PRIVATE :: pari_remote_cut = 99
+   INTEGER, PRIVATE :: pari_vgate = 99
+   INTEGER, PRIVATE :: pari_hard_gate = 99
+   REAL(KIND=dp), PRIVATE :: pari_sac_f = 1.0_dp
+   ! TODO(dev experiment, remove before PR): aux-cell placement mode. 1 = extended
+   ! (per-image RI blocks from get_kp_and_ri_images; the home block index stays
+   ! katom, so aliased neighbor-aux contributions land elsewhere and are never
+   ! read). 0 = legacy, every aux image folded into the main-cell block, which
+   ! build_3c_integrals SUMS into that block (summation=.TRUE.)
+   INTEGER, PRIVATE :: pari_ri_mode = 1
+   ! TODO(dev diagnostic, remove before PR): per-term F images and far-chain
+   ! source accumulators; off by default -- their GEMMs double every scatter
+   LOGICAL, PRIVATE :: pari_diag = .FALSE.
 
    PUBLIC :: hfx_ri_update_ks_kp_pari, pari_pair_pinv
 
@@ -97,10 +122,10 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'pari_pair_pinv'
 
-      INTEGER                                            :: handle, n
-      REAL(KIND=dp)                                      :: ainv_norm, a_norm
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)          :: work
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)       :: vwork
+      INTEGER                                            :: handle, i, info, lwork, n
+      REAL(KIND=dp)                                      :: ainv_norm, a_norm, mu, w_inv
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)          :: w, work
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)       :: u_scaled, vwork
       REAL(KIND=dp), EXTERNAL                            :: dlange
 
       CALL timeset(routineN, handle)
@@ -110,19 +135,36 @@ CONTAINS
       CPASSERT(SIZE(vinv, 1) == n .AND. SIZE(vinv, 2) == n)
       CPASSERT(eps_eig > 0.0_dp)
 
-      ! get_pseudo_inverse_diag destroys its input argument
-      ALLOCATE (vwork(n, n), work(n))
+      ! Levenberg-Marquardt soft filtering of the pair metric inverse:
+      ! w_inv = w / (w^2 + mu^2) with mu = eps_eig * w_max. Genuine modes
+      ! (w >> mu) stay unbiased, near-null and noise modes damp smoothly to
+      ! zero, and the global amplification is capped at 1/(2 mu); unlike a
+      ! hard cutoff the response is differentiable, so the SCF mixer never
+      ! sees eigenvalue threshold jumps
+      ALLOCATE (vwork(n, n), work(3*n - 1), w(n), u_scaled(n, n))
       vwork(:, :) = vmat
+      lwork = SIZE(work)
+      CALL dsyev('V', 'U', n, vwork, n, w, work, lwork, info)
+      CPASSERT(info == 0)
 
-      CALL get_pseudo_inverse_diag(vwork, vinv, eps_eig)
+      mu = eps_eig*MAXVAL(w)
+      DO i = 1, n
+         IF (w(i) > 0.0_dp) THEN
+            w_inv = w(i)/(w(i)*w(i) + mu*mu)
+         ELSE
+            w_inv = 0.0_dp
+         END IF
+         u_scaled(:, i) = w_inv*vwork(:, i)
+      END DO
+      CALL dgemm('N', 'T', n, n, n, 1.0_dp, u_scaled, n, vwork, n, 0.0_dp, vinv, n)
 
-      ! condition estimate from the 1-norms of V and V^+ (the truncated spectrum
+      ! condition estimate from the 1-norms of V and V^+ (the filtered spectrum
       ! makes dpocon-style bounds meaningless, so a norm product is used instead)
       a_norm = dlange('1', n, n, vmat, n, work)
       ainv_norm = dlange('1', n, n, vinv, n, work)
       rcond = 1.0_dp/(a_norm*ainv_norm)
 
-      DEALLOCATE (vwork, work)
+      DEALLOCATE (vwork, work, w, u_scaled)
 
       CALL timestop(handle)
 
@@ -158,6 +200,7 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER :: routineN = 'hfx_ri_update_ks_kp_pari'
 
       INTEGER                                            :: handle
+      REAL(KIND=dp)                                      :: fac
 
       CPASSERT(nspins > 0)
       CPASSERT(hf_fraction >= 0.0_dp)
@@ -165,26 +208,990 @@ CONTAINS
       CALL timeset(routineN, handle)
 
       IF (geometry_did_change) THEN
-         CALL cp_warn(__LOCATION__, "PARI k-points: SCF-side KS assembly not implemented yet, "// &
-                      "exchange contributions are zero")
          CALL hfx_ri_pre_scf_kp_pari(ks_matrix(1, 1)%matrix, ri_data, qs_env)
       END IF
 
-      !TODO(B3): four-term KS assembly from the cached C3 coefficients and the
-      ! per-image 2c potential, mirroring the hfx_ri_kp.F contraction structure
-      ehfx = 0.0_dp
+      IF (nspins == 1) THEN
+         fac = 0.5_dp*hf_fraction
+      ELSE
+         fac = 1.0_dp*hf_fraction
+      END IF
+
+      CALL pari_assemble_ks(ri_data, qs_env, rho_ao, ks_matrix, ehfx, fac, hf_fraction)
 
       CALL timestop(handle)
 
    END SUBROUTINE hfx_ri_update_ks_kp_pari
 
 ! **************************************************************************************************
+!> \brief Four-term PARI KS assembly (k_paper / JPCL eq 16 structure), dense
+!>        image-general version: produces the KS matrix of EVERY periodic image
+!>        F(mu^0, nu^b), b = 1..nimg; the k-point phases are applied downstream
+!>        by the k-point machinery (the image basis carries them implicitly).
+!>        The same-site 0.5 weight is folded into the cached C3 coefficients
+!>        (pair (i,i,main)).
+!>
+!>        Periodic kernel per output (mu on atom i, cell 0; nu on atom j, cell b),
+!>        with the density P(s^x, l^y) and the pair fits C3[X,Y,y] (fit of the
+!>        product mu_X^0 nu_Y^y, rows on X; partner rows reachable as
+!>        C3[Y,X,-y] by the (mu nu|P) pair symmetry):
+!>          Ma=i:  T1  F(i,j,b) += BD_i(mu, la(l,y)) . V^y[i,l] . C3(l, j, b-y)
+!>                 T2  F(i,j,b) += BD_i(mu, la(l,y)) . V^b[i,j] . C3(j, l, y-b)
+!>          Ma=k:  T3  F(i,j,b) += BD2_k^{(x)}(la(l,y), mu) . V^{y-x}[k,l] . C3(l, j, b-y)
+!>                 T4  F(i,j,b) += BD2_k^{(x)}(la(l,y), mu) . V^{b-x}[k,j] . C3(j, l, y-b)
+!>        where BD_i(p, mu, la^y) = sum_{k,x,s} C3[i,k,x](p,mu,s) P(s^x, la^y)
+!>              BD2_k^{(x)}(p, la^y, mu) = sum_s C3[k,i,-x](p,s,mu) P(s^x, la^y)
+!>        and V^z[A,B] = (P_A^0|Q_B^z) block of the per-image 2c matrix.
+!>        All four reduce to the molecular main-image recipe when only the main
+!>        image is populated (verified against the pyscf oracle, gate G1/G2).
+!>        Structural identity: F^b = (F^{-b})^T (asserted, warning if violated).
+!> \param ri_data ...
+!> \param qs_env ...
+!> \param rho_ao density matrix images (symmetric-typed, P_ab^i = P_ba^-i)
+!> \param ks_matrix KS matrix images (accumulated with -fac, legacy convention)
+!> \param ehfx exchange energy 0.5 sum_b Tr((-fac F^b) P^b)
+!> \param fac spin-reduced exchange prefactor
+!> \param hf_fraction ...
+! **************************************************************************************************
+   SUBROUTINE pari_assemble_ks(ri_data, qs_env, rho_ao, ks_matrix, ehfx, fac, hf_fraction)
+      TYPE(hfx_ri_type), INTENT(INOUT)                  :: ri_data
+      TYPE(qs_environment_type), POINTER                :: qs_env
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER      :: rho_ao, ks_matrix
+      REAL(KIND=dp), INTENT(OUT)                        :: ehfx
+      REAL(KIND=dp), INTENT(IN)                         :: fac, hf_fraction
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'pari_assemble_ks'
+
+      CHARACTER(LEN=64)                                  :: progbuf
+      INTEGER                                            :: ienv
+      LOGICAL                                            :: qexist
+      REAL(KIND=dp)                                     :: t_stage
+      EXTERNAL :: dgemm
+      INTEGER :: Aat, Bat, b_img, handle, htot, i, ie, ip, ithr, iu, iy, iz, j, jb, k, l, lam, &
+                 lc, mu, nAOi, nAOj, nAOk, nAOl, gstep, nimg, naomax, nlive, npd, nRIi, &
+                 ki_tot, nRIj, nRIk, nRIl, nrimax, nao, natom, npct, nthr, nu, nyl, o0, src, &
+                 offI, offJ, offK, offL, lpct, unit_dump, u_img, v_img, w_img, x_img, &
+                 y_img, z_img, z1, z2
+      INTEGER, ALLOCATABLE, DIMENSION(:)                :: glen, slg, live_ip, live_y, mimg, pd_list, &
+                                                            pd_rev, y_list
+      INTEGER, ALLOCATABLE, DIMENSION(:, :)             :: hoff, imgcell, live_fill, live_off, reldiff
+      INTEGER, ALLOCATABLE, DIMENSION(:, :, :)          :: pair3, pair3s
+      INTEGER, ALLOCATABLE, DIMENSION(:, :)             :: live_cnt
+      LOGICAL, ALLOCATABLE, DIMENSION(:)                :: ylive
+      LOGICAL, ALLOCATABLE, DIMENSION(:, :, :)          :: liveH
+      INTEGER, DIMENSION(3)                             :: dc
+      INTEGER, DIMENSION(:, :), POINTER                 :: index_to_cell
+      INTEGER, DIMENSION(:, :, :), POINTER              :: cell_to_index
+      REAL(KIND=dp)                                     :: d1y, d1z, d4e, d4v, d4w, half, trb, worst_sym
+      LOGICAL                                            :: lpair
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)          :: c3norm, c3norms, c3t, Gflat, Gj, Hflat, pdiff_norm
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)       :: ptmp, vblk
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)    :: bd2_blk, fimg, pdiff
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :) :: fimg_t
+      ! TODO(dev diagnostic, remove before PR): far-chain source accumulators
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :) :: f1src_y, f1src_z, f4src_e, f4src_v, f4src_w
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :) :: bd_all
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :, :) :: bd2buf
+      REAL(KIND=dp), DIMENSION(:, :), POINTER           :: blk
+      TYPE(dbcsr_iterator_type)                          :: iter
+      TYPE(kpoint_type), POINTER                         :: kpoints
+
+      NULLIFY (kpoints, cell_to_index, index_to_cell, blk)
+      CALL timeset(routineN, handle)
+
+      ! TODO(dev experiment, remove before PR): per-term ablation switch,
+      ! selected by a PARI_TERM_MASK file in the run directory (bit 1=T1, 2=T2, 4=T3, 8=T4)
+      INQUIRE (FILE="PARI_TERM_MASK", EXIST=qexist)
+      IF (qexist) THEN
+         OPEN (NEWUNIT=ienv, FILE="PARI_TERM_MASK", status="old", action="read")
+         READ (ienv, *) pari_term_mask
+         CLOSE (ienv)
+      END IF
+      INQUIRE (FILE="PARI_VGATE", EXIST=qexist)
+      IF (qexist) THEN
+         OPEN (NEWUNIT=ienv, FILE="PARI_VGATE", status="old", action="read")
+         READ (ienv, *) pari_vgate
+         CLOSE (ienv)
+      END IF
+      ! TODO(dev experiment, remove before PR): the five legacy hardcoded
+      ! image-index gates of the four-term assembly (defaults off, see above)
+      INQUIRE (FILE="PARI_HARD_GATE", EXIST=qexist)
+      IF (qexist) THEN
+         OPEN (NEWUNIT=ienv, FILE="PARI_HARD_GATE", status="old", action="read")
+         READ (ienv, *) pari_hard_gate
+         CLOSE (ienv)
+      END IF
+      ! TODO(dev diagnostic, remove before PR): opt-in diagnostics
+      INQUIRE (FILE="PARI_KEEP_DIAG", EXIST=qexist)
+      IF (qexist) pari_diag = .TRUE.
+
+      CPASSERT(SIZE(rho_ao, 1) == 1) ! spin-generalisation is a follow-up
+
+      natom = SIZE(ri_data%bsizes_AO)
+      nao = SUM(ri_data%bsizes_AO)
+      nimg = ri_data%pari_nimg
+
+      CALL get_qs_env(qs_env, kpoints=kpoints)
+      CALL get_kpoint_info(kpoints, cell_to_index=cell_to_index, index_to_cell=index_to_cell)
+
+      ! image cells, opposite-image and relative-image tables
+      ALLOCATE (mimg(nimg), reldiff(nimg, nimg))
+      mimg = 0
+      reldiff = 0
+      DO b_img = 1, nimg
+         dc = -index_to_cell(:, b_img)
+         IF (dc(1) >= LBOUND(cell_to_index, 1) .AND. dc(1) <= UBOUND(cell_to_index, 1) .AND. &
+             dc(2) >= LBOUND(cell_to_index, 2) .AND. dc(2) <= UBOUND(cell_to_index, 2) .AND. &
+             dc(3) >= LBOUND(cell_to_index, 3) .AND. dc(3) <= UBOUND(cell_to_index, 3)) THEN
+            ! the k-point cell list may extend beyond the HFX image range
+            IF (cell_to_index(dc(1), dc(2), dc(3)) <= nimg) THEN
+               mimg(b_img) = cell_to_index(dc(1), dc(2), dc(3))
+            END IF
+         END IF
+      END DO
+      DO b_img = 1, nimg
+         DO y_img = 1, nimg
+            dc = index_to_cell(:, b_img) - index_to_cell(:, y_img)
+            IF (dc(1) >= LBOUND(cell_to_index, 1) .AND. dc(1) <= UBOUND(cell_to_index, 1) .AND. &
+                dc(2) >= LBOUND(cell_to_index, 2) .AND. dc(2) <= UBOUND(cell_to_index, 2) .AND. &
+                dc(3) >= LBOUND(cell_to_index, 3) .AND. dc(3) <= UBOUND(cell_to_index, 3)) THEN
+               IF (cell_to_index(dc(1), dc(2), dc(3)) <= nimg) THEN
+                  reldiff(b_img, y_img) = cell_to_index(dc(1), dc(2), dc(3))
+               END IF
+            END IF
+         END DO
+      END DO
+
+      ! dense density images, mirroring the legacy storage convention exactly:
+      ! the symmetric neighbor list stores each unordered atom pair {a, b} in
+      ! ONE orientation chosen by the parity of a+b (qs_neighbor_lists), so the
+      ! stored block (a, b) of image z holds M(a@0, b@s*c_z) with s = +1 for
+      ! even pairs (a+b even, incl. same atom) and s = -1 for odd pairs. Each
+      ! stored block deposits into (a, b) of the s*z image and (b, a)^T of its
+      ! opposite (P_ab^z = P_ba^-z); the same-atom blocks of a mirror pair are
+      ! stored twice and both deposits land on the image diagonal, hence 0.5.
+      ALLOCATE (pdiff(nao, nao, nimg), ptmp(nao, nao))
+      pdiff = 0.0_dp
+      DO b_img = 1, nimg
+         CALL dbcsr_iterator_start(iter, rho_ao(1, b_img)%matrix)
+         DO WHILE (dbcsr_iterator_blocks_left(iter))
+            CALL dbcsr_iterator_next_block(iter, Aat, Bat, blk)
+            offI = SUM(ri_data%bsizes_AO(1:Aat - 1)); nAOi = ri_data%bsizes_AO(Aat)
+            offJ = SUM(ri_data%bsizes_AO(1:Bat - 1)); nAOj = ri_data%bsizes_AO(Bat)
+            lpair = MOD(Aat + Bat, 2) == 0
+            IF (lpair) THEN
+               half = 1.0_dp
+               IF (Aat == Bat .AND. mimg(b_img) /= 0) half = 0.5_dp
+               pdiff(offI + 1:offI + nAOi, offJ + 1:offJ + nAOj, b_img) = &
+                  pdiff(offI + 1:offI + nAOi, offJ + 1:offJ + nAOj, b_img) + half*blk(:, :)
+               IF (mimg(b_img) > 0) THEN
+                  pdiff(offJ + 1:offJ + nAOj, offI + 1:offI + nAOi, mimg(b_img)) = &
+                     pdiff(offJ + 1:offJ + nAOj, offI + 1:offI + nAOi, mimg(b_img)) &
+                     + half*TRANSPOSE(blk(:, :))
+               END IF
+            ELSE
+               ! odd pair: the stored block lives at the negated cell, so the
+               ! deposits swap image and transpose
+               pdiff(offJ + 1:offJ + nAOj, offI + 1:offI + nAOi, b_img) = &
+                  pdiff(offJ + 1:offJ + nAOj, offI + 1:offI + nAOi, b_img) + TRANSPOSE(blk(:, :))
+               IF (mimg(b_img) > 0) THEN
+                  pdiff(offI + 1:offI + nAOi, offJ + 1:offJ + nAOj, mimg(b_img)) = &
+                     pdiff(offI + 1:offI + nAOi, offJ + 1:offJ + nAOj, mimg(b_img)) + blk(:, :)
+               END IF
+            END IF
+         END DO
+         CALL dbcsr_iterator_stop(iter)
+      END DO
+      ! S1 (symmetric closure): images without a mirror participate one-sidedly
+      ! only; their density is voided so that no term references them
+      DO b_img = 1, nimg
+         IF (mimg(b_img) == 0) pdiff(:, :, b_img) = 0.0_dp
+      END DO
+      ALLOCATE (pdiff_norm(nimg))
+      DO b_img = 1, nimg
+         pdiff_norm(b_img) = SQRT(SUM(pdiff(:, :, b_img)**2))
+      END DO
+
+      ! pool lookup per (X, Y, y), pooled C3 norms, and the flat live-pair
+      ! lists (dead image pairs have exactly-zero C3; the Coulomb 2c tail keeps
+      ! them in the pair enumeration, so presence alone is not a screen)
+      ALLOCATE (pair3(natom, natom, nimg), c3norm(ri_data%pari_npair))
+      ALLOCATE (live_cnt(natom, natom), live_off(natom, natom))
+      pair3 = 0
+      c3norm = 0.0_dp
+      live_cnt = 0
+      live_off = 1
+      DO ip = 1, ri_data%pari_npair
+         c3norm(ip) = SQRT(SUM(ri_data%pari_c3(ri_data%pari_c3_offset(ip): &
+                                              ri_data%pari_c3_offset(ip + 1) - 1)**2))
+         IF (ri_data%pari_pair_img(ip) >= 1 .AND. ri_data%pari_pair_img(ip) <= nimg) THEN
+            pair3(ri_data%pari_pair_i(ip), ri_data%pari_pair_j(ip), ri_data%pari_pair_img(ip)) = ip
+         END IF
+      END DO
+      ! S3 (symmetric closure): a pool pair participates only if its mirror pair
+      ! (j, i, -img) is also present (one-sided absence is dropped on both sides);
+      ! liveness uses the union of the mirror-pair norms (both sides carry their
+      ! own solve's values). Mirrorless images cannot have mirror pairs.
+      ALLOCATE (pair3s(natom, natom, nimg), c3norms(ri_data%pari_npair))
+      pair3s = pair3
+      DO ip = 1, ri_data%pari_npair
+         c3norms(ip) = c3norm(ip)
+         IF (ri_data%pari_pair_img(ip) >= 1 .AND. ri_data%pari_pair_img(ip) <= nimg) THEN
+            Aat = ri_data%pari_pair_i(ip); Bat = ri_data%pari_pair_j(ip)
+            y_img = ri_data%pari_pair_img(ip)
+            z_img = mimg(y_img)
+            IF (z_img == 0) THEN
+               pair3s(Aat, Bat, y_img) = 0
+            ELSE IF (pair3(Bat, Aat, z_img) == 0) THEN
+               pair3s(Aat, Bat, y_img) = 0
+            ELSE
+               c3norms(ip) = MAX(c3norm(ip), c3norm(pair3(Bat, Aat, z_img)))
+            END IF
+         END IF
+      END DO
+      DO ip = 1, ri_data%pari_npair
+         IF (ri_data%pari_pair_img(ip) >= 1 .AND. ri_data%pari_pair_img(ip) <= nimg) THEN
+            IF (pair3s(ri_data%pari_pair_i(ip), ri_data%pari_pair_j(ip), ri_data%pari_pair_img(ip)) /= 0 .AND. &
+                c3norms(ip) > 1.0E-12_dp) live_cnt(ri_data%pari_pair_i(ip), ri_data%pari_pair_j(ip)) = &
+               live_cnt(ri_data%pari_pair_i(ip), ri_data%pari_pair_j(ip)) + 1
+         END IF
+      END DO
+      nlive = SUM(live_cnt)
+      ALLOCATE (live_y(nlive), live_ip(nlive))
+      live_off(1, 1) = 1
+      DO Aat = 1, natom
+         DO Bat = 1, natom
+            IF (Aat == 1 .AND. Bat == 1) THEN
+               CYCLE
+            ELSE IF (Bat == 1) THEN
+               live_off(Aat, Bat) = live_off(Aat - 1, natom) + live_cnt(Aat - 1, natom)
+            ELSE
+               live_off(Aat, Bat) = live_off(Aat, Bat - 1) + live_cnt(Aat, Bat - 1)
+            END IF
+         END DO
+      END DO
+      ALLOCATE (live_fill(natom, natom))
+      live_fill = live_off
+      DO ip = 1, ri_data%pari_npair
+         IF (ri_data%pari_pair_img(ip) >= 1 .AND. ri_data%pari_pair_img(ip) <= nimg) THEN
+            Aat = ri_data%pari_pair_i(ip); Bat = ri_data%pari_pair_j(ip)
+            IF (c3norms(ip) > 1.0E-12_dp .AND. &
+                 pair3s(Aat, Bat, ri_data%pari_pair_img(ip)) /= 0) THEN
+               live_y(live_fill(Aat, Bat)) = ri_data%pari_pair_img(ip)
+               live_ip(live_fill(Aat, Bat)) = ip
+               live_fill(Aat, Bat) = live_fill(Aat, Bat) + 1
+            END IF
+         END IF
+      END DO
+      DEALLOCATE (live_fill)
+
+      ALLOCATE (imgcell(3, nimg))
+      imgcell(:, :) = index_to_cell(:, 1:nimg)
+
+      ! density-live images
+      ALLOCATE (pd_list(nimg))
+      npd = 0
+      DO b_img = 1, nimg
+         IF (pdiff_norm(b_img) > 1.0E-14_dp) THEN
+            npd = npd + 1
+            pd_list(npd) = b_img
+         END IF
+      END DO
+
+      ALLOCATE (fimg(nao, nao, nimg))
+      fimg = 0.0_dp
+      ! TODO(dev diagnostic, remove before PR): per-term F images and far-chain
+      ! sources (T1 by |y| / |z1|, T4 by |e| / |v| / |w|; cell norm >= 3 is far)
+      IF (pari_diag) THEN
+         ALLOCATE (fimg_t(nao, nao, nimg, 4))
+         fimg_t = 0.0_dp
+         ALLOCATE (f1src_y(nao, nao, nimg), f1src_z(nao, nao, nimg))
+         ALLOCATE (f4src_e(nao, nao, nimg), f4src_v(nao, nao, nimg), f4src_w(nao, nao, nimg))
+         f1src_y = 0.0_dp; f1src_z = 0.0_dp
+         f4src_e = 0.0_dp; f4src_v = 0.0_dp; f4src_w = 0.0_dp
+      END IF
+      nrimax = MAXVAL(ri_data%bsizes_RI)
+      naomax = MAXVAL(ri_data%bsizes_AO)
+      ALLOCATE (vblk(nrimax, nrimax))
+      ALLOCATE (bd2_blk(nrimax, naomax, naomax))
+      ALLOCATE (Gj(naomax*nrimax*naomax))
+      ALLOCATE (y_list(nimg), ylive(nimg), pd_rev(nimg))
+      ALLOCATE (bd2buf(nrimax, naomax, naomax, MAX(1, npd), natom))
+      pd_rev = 0
+      DO iz = 1, npd
+         pd_rev(pd_list(iz)) = iz
+      END DO
+
+      ! transposed pool copy c3t, (p, mu_own, nu_partner) -> (p, nu_partner, mu_own):
+      ! the T2/T4 right factors are own=j pairs, whose joint (q, lam) folding needs
+      ! the partner AO index adjacent to the RI index; the layout is certified
+      ! offline (slice2b/b7_batched.py). Same segment offsets as pari_c3.
+      ALLOCATE (c3t(SIZE(ri_data%pari_c3)))
+!$OMP PARALLEL DEFAULT(NONE) &
+!$OMP SHARED(ri_data, c3t) &
+!$OMP PRIVATE(ip, k, j, nRIk, nAOk, nAOj, o0, mu, nu, ithr, nthr)
+      ithr = 0
+      nthr = 1
+!$     ithr = omp_get_thread_num()
+!$     nthr = omp_get_max_threads()
+      DO ip = 1, SIZE(ri_data%pari_pair_i)
+         IF (MOD(ip - 1, nthr) /= ithr) CYCLE
+         k = ri_data%pari_pair_i(ip)
+         j = ri_data%pari_pair_j(ip)
+         nRIk = ri_data%bsizes_RI(k); nAOk = ri_data%bsizes_AO(k); nAOj = ri_data%bsizes_AO(j)
+         o0 = ri_data%pari_c3_offset(ip) - 1
+         DO nu = 1, nAOj
+            DO mu = 1, nAOk
+               c3t(o0 + 1 + (nu - 1)*nRIk + (mu - 1)*nRIk*nAOj:o0 + nu*nRIk + (mu - 1)*nRIk*nAOj) = &
+                  ri_data%pari_c3(o0 + 1 + (mu - 1)*nRIk + (nu - 1)*nRIk*nAOk: &
+                                  o0 + mu*nRIk + (nu - 1)*nRIk*nAOk)
+            END DO
+         END DO
+      END DO
+!$OMP END PARALLEL
+
+      DO i = 1, natom
+         nRIi = ri_data%bsizes_RI(i); nAOi = ri_data%bsizes_AO(i)
+         offI = SUM(ri_data%bsizes_AO(1:i - 1))
+         WRITE (progbuf, '(I0,A,I0)') i, "/", natom
+
+         ! ---- BD for atom i over all (l, y): live x/z enumeration; threads
+         ! own the density-image index z, which maps one-to-one to y = x + z
+         ! for a fixed x (disjoint writes); a barrier per live x protects the
+         ! accumulation across different x into the same y. One joint GEMM per
+         ! (k, x, z): the pool segment is read in place as (nRIi*nAOi, nAOk)
+         ! and the y-slab of bd_all as (nRIi*nAOi, nao)
+         ALLOCATE (bd_all(nRIi, nAOi, nao, nimg))
+         bd_all = 0.0_dp
+!$OMP PARALLEL DEFAULT(NONE) &
+!$OMP SHARED(i, ri_data, natom, npd, nimg, nao, bd_all, cell_to_index, imgcell, live_off, live_cnt, &
+!$OMP        live_y, live_ip, pd_list, pdiff, nRIi, nAOi) &
+!$OMP PRIVATE(k, ie, x_img, iz, z_img, y_img, nAOk, offK, ithr, nthr)
+         ithr = 0
+         nthr = 1
+!$       ithr = omp_get_thread_num()
+!$       nthr = omp_get_max_threads()
+         DO k = 1, natom
+            nAOk = ri_data%bsizes_AO(k)
+            offK = SUM(ri_data%bsizes_AO(1:k - 1))
+            DO ie = live_off(i, k), live_off(i, k) + live_cnt(i, k) - 1
+               x_img = live_y(ie)
+               DO iz = 1, npd
+                  IF (MOD(iz - 1, nthr) /= ithr) CYCLE
+                  z_img = pd_list(iz)
+                  y_img = pari_imgsum(cell_to_index, imgcell, nimg, imgcell(:, x_img), imgcell(:, z_img))
+                  IF (y_img == 0) CYCLE
+                  CALL dgemm('N', 'N', nRIi*nAOi, nao, nAOk, 1.0_dp, &
+                             ri_data%pari_c3(ri_data%pari_c3_offset(live_ip(ie))), nRIi*nAOi, &
+                             pdiff(offK + 1, 1, z_img), nao, 1.0_dp, bd_all(1, 1, 1, y_img), nRIi*nAOi)
+               END DO
+!$OMP BARRIER
+            END DO
+         END DO
+!$OMP END PARALLEL
+         nyl = 0
+         ylive = .FALSE.
+         DO b_img = 1, nimg
+            IF (mimg(b_img) > 0 .AND. SQRT(SUM(bd_all(:, :, :, b_img)**2)) > 0.0_dp) THEN
+               nyl = nyl + 1
+               y_list(nyl) = b_img
+               ylive(b_img) = .TRUE.
+            END IF
+         END DO
+         CALL pari_stage_banner(ri_data, "KS assembly: BD done, four-term stages atom "//TRIM(progbuf))
+         t_stage = m_walltime()
+
+         ! ================= T1: hoist G(l,y) = BD_i(l,y)^T . V^y[i,l] once per
+         ! (l, y) into the shared Gflat table (joint (q, lam) layout, block per
+         ! (l, y), (l, iy) ownership, disjoint writes); the (j, b) blocks are
+         ! then scattered under (j, b) ownership with ONE joint GEMM per combo
+         ! (the pool segment is read in place as (nRIl*nAOl, nAOj))
+         ALLOCATE (glen(natom))
+         DO l = 1, natom
+            glen(l) = nAOi*ri_data%bsizes_RI(l)*ri_data%bsizes_AO(l)
+         END DO
+         gstep = SUM(glen)
+         ALLOCATE (Gflat(nyl*gstep))
+!$OMP PARALLEL DEFAULT(NONE) &
+!$OMP SHARED(pari_term_mask, i, ri_data, natom, nimg, nao, nyl, y_list, bd_all, fimg, reldiff, pair3s, c3norms, nRIi, nAOi, &
+!$OMP        offI, glen, gstep, Gflat, nrimax, fimg_t, f1src_y, f1src_z, imgcell, pari_hard_gate, &
+!$OMP        pari_diag) &
+!$OMP PRIVATE(l, nRIl, nAOl, offL, iy, y_img, lam, lc, jb, j, nAOj, offJ, b_img, z1, vblk, ithr, nthr)
+         ithr = 0
+         nthr = 1
+!$       ithr = omp_get_thread_num()
+!$       nthr = omp_get_max_threads()
+         IF (ALLOCATED (vblk)) DEALLOCATE (vblk)
+         ALLOCATE (vblk(nrimax, nrimax))
+         DO lc = 1, natom*nyl
+            IF (MOD(lc - 1, nthr) /= ithr) CYCLE
+            l = (lc - 1)/nyl + 1
+            iy = lc - (l - 1)*nyl
+            y_img = y_list(iy)
+            nRIl = ri_data%bsizes_RI(l); nAOl = ri_data%bsizes_AO(l)
+            offL = SUM(ri_data%bsizes_AO(1:l - 1))
+            CALL pari_vblock(vblk, ri_data%pari_mat_2c(y_img), i, l, nRIi, nRIl)
+            DO lam = 1, nAOl
+               CALL dgemm('T', 'N', nAOi, nRIl, nRIi, 1.0_dp, bd_all(1, 1, offL + lam, y_img), nRIi, &
+                          vblk, nrimax, 0.0_dp, &
+                          Gflat((iy - 1)*gstep + SUM(glen(1:l - 1)) + (lam - 1)*nAOi*nRIl + 1), nAOi)
+            END DO
+         END DO
+!$OMP BARRIER
+         DO jb = 1, MERGE(natom*nimg, 0, IAND(pari_term_mask, 1) /= 0)
+            IF (MOD(jb - 1, nthr) /= ithr) CYCLE
+            j = (jb - 1)/nimg + 1
+            b_img = jb - (j - 1)*nimg
+            nAOj = ri_data%bsizes_AO(j)
+            offJ = SUM(ri_data%bsizes_AO(1:j - 1))
+            DO l = 1, natom
+               nRIl = ri_data%bsizes_RI(l); nAOl = ri_data%bsizes_AO(l)
+               DO iy = 1, nyl
+                  y_img = y_list(iy)
+                  z1 = reldiff(b_img, y_img)
+                  IF (z1 <= 0) CYCLE
+                  IF (pair3s(l, j, z1) == 0) CYCLE
+                  IF (c3norms(pair3s(l, j, z1)) <= 1.0E-12_dp) CYCLE
+                  CALL dgemm('N', 'N', nAOi, nAOj, nRIl*nAOl, 1.0_dp, &
+                             Gflat((iy - 1)*gstep + SUM(glen(1:l - 1)) + 1), nAOi, &
+                             ri_data%pari_c3(ri_data%pari_c3_offset(pair3s(l, j, z1))), nRIl*nAOl, &
+                             1.0_dp, fimg(offI + 1, offJ + 1, b_img), nao)
+                  ! TODO(dev diagnostic, remove before PR): per-term + far-chain
+                  IF (pari_diag) THEN
+                     CALL dgemm('N', 'N', nAOi, nAOj, nRIl*nAOl, 1.0_dp, &
+                                Gflat((iy - 1)*gstep + SUM(glen(1:l - 1)) + 1), nAOi, &
+                                ri_data%pari_c3(ri_data%pari_c3_offset(pair3s(l, j, z1))), nRIl*nAOl, &
+                                1.0_dp, fimg_t(offI + 1, offJ + 1, b_img, 1), nao)
+                     IF (SUM(ABS(imgcell(:, y_img))) >= pari_hard_gate) THEN
+                        CALL dgemm('N', 'N', nAOi, nAOj, nRIl*nAOl, 1.0_dp, &
+                                   Gflat((iy - 1)*gstep + SUM(glen(1:l - 1)) + 1), nAOi, &
+                                   ri_data%pari_c3(ri_data%pari_c3_offset(pair3s(l, j, z1))), nRIl*nAOl, &
+                                   1.0_dp, f1src_y(offI + 1, offJ + 1, b_img), nao)
+                     END IF
+                     IF (SUM(ABS(imgcell(:, z1))) >= pari_hard_gate) THEN
+                        CALL dgemm('N', 'N', nAOi, nAOj, nRIl*nAOl, 1.0_dp, &
+                                   Gflat((iy - 1)*gstep + SUM(glen(1:l - 1)) + 1), nAOi, &
+                                   ri_data%pari_c3(ri_data%pari_c3_offset(pair3s(l, j, z1))), nRIl*nAOl, &
+                                   1.0_dp, f1src_z(offI + 1, offJ + 1, b_img), nao)
+                     END IF
+                  END IF
+               END DO
+            END DO
+         END DO
+         DEALLOCATE (vblk)
+!$OMP END PARALLEL
+         DEALLOCATE (Gflat, glen)
+         WRITE (progbuf, '(A,I0,A,I0,A,F8.1,A)') "KS assembly: T1 done atom ", i, "/", natom, &
+            " (wall ", m_walltime() - t_stage, " s)"
+         CALL pari_stage_banner(ri_data, TRIM(progbuf))
+
+         ! ================= T3: stream BD2(k,x,z,l) over the live (k, x, z)
+         ! with per-mu GEMMs off the pool, contract with V^z[k,l] and fold
+         ! directly into the shared Hflat table (joint (q, lam) layout, block
+         ! per (k, l), image u = x+z outermost, beta=1 accumulation); the
+         ! (j, b) scatter is ONE joint GEMM per (k, u, l, j, b). The
+         ! y-in-y_list restriction of the original walk is preserved through
+         ! the ylive gate on u.
+         ALLOCATE (slg(natom), hoff(natom, natom))
+         DO l = 1, natom
+            slg(l) = nAOi*ri_data%bsizes_RI(l)*ri_data%bsizes_AO(l)
+         END DO
+         htot = nimg*SUM(slg)
+         DO k = 1, natom
+            DO l = 1, natom
+               hoff(k, l) = (k - 1)*htot + nimg*SUM(slg(1:l - 1))
+            END DO
+         END DO
+         ALLOCATE (Hflat(natom*htot))
+         ALLOCATE (liveH(natom, nimg, natom))
+         Hflat = 0.0_dp
+         liveH = .FALSE.
+         ki_tot = live_off(natom, i) + live_cnt(natom, i) - live_off(1, i)
+         t_stage = m_walltime()
+!$OMP PARALLEL DEFAULT(NONE) &
+!$OMP SHARED(i, ri_data, natom, nimg, nao, npd, nrimax, naomax, cell_to_index, imgcell, live_off, live_cnt, &
+!$OMP        live_y, live_ip, pd_list, pdiff, reldiff, mimg, ylive, pair3s, Hflat, hoff, slg, liveH, &
+!$OMP        nAOi, ki_tot) &
+!$OMP PRIVATE(k, nRIk, nAOk, offK, ie, x_img, iz, z_img, u_img, l, nRIl, nAOl, offL, lam, mu, bd2_blk, &
+!$OMP        vblk, ithr, nthr, npct, lpct, progbuf)
+         ithr = 0
+         nthr = 1
+         lpct = 0
+!$       ithr = omp_get_thread_num()
+!$       nthr = omp_get_max_threads()
+         IF (ALLOCATED (bd2_blk)) DEALLOCATE (bd2_blk)
+         IF (ALLOCATED (vblk)) DEALLOCATE (vblk)
+         ALLOCATE (bd2_blk(nrimax, naomax, naomax))
+         ALLOCATE (vblk(nrimax, nrimax))
+         DO k = 1, natom
+            nRIk = ri_data%bsizes_RI(k); nAOk = ri_data%bsizes_AO(k)
+            offK = SUM(ri_data%bsizes_AO(1:k - 1))
+            DO ie = live_off(k, i), live_off(k, i) + live_cnt(k, i) - 1
+               IF (mimg(live_y(ie)) == 0) CYCLE
+               x_img = mimg(live_y(ie))
+               DO iz = 1, npd
+                  IF (MOD(iz - 1, nthr) /= ithr) CYCLE
+                  z_img = pd_list(iz)
+                  u_img = pari_imgsum(cell_to_index, imgcell, nimg, imgcell(:, x_img), imgcell(:, z_img))
+                  IF (u_img == 0) CYCLE
+                  IF (.NOT. ylive(u_img)) CYCLE
+                  DO l = 1, natom
+                     nRIl = ri_data%bsizes_RI(l); nAOl = ri_data%bsizes_AO(l)
+                     offL = SUM(ri_data%bsizes_AO(1:l - 1))
+                     IF (pair3s(k, l, z_img) == 0) CYCLE
+                     CALL pari_vblock(vblk, ri_data%pari_mat_2c(z_img), k, l, nRIk, nRIl)
+                     ! BD2(p, lam, mu) = sum_s C3(k,i,-x)(p,s,mu) . P(s^z, lam^l),
+                     ! one GEMM per mu writing the (p, lam) face in place
+                     DO mu = 1, nAOi
+                        CALL dgemm('N', 'N', nRIk, nAOl, nAOk, 1.0_dp, &
+                                   ri_data%pari_c3(ri_data%pari_c3_offset(live_ip(ie)) + &
+                                                   (mu - 1)*nRIk*nAOk), nRIk, &
+                                   pdiff(offK + 1, offL + 1, z_img), nao, 0.0_dp, &
+                                   bd2_blk(1, 1, mu), nrimax)
+                     END DO
+                     DO lam = 1, nAOl
+                        CALL dgemm('T', 'N', nAOi, nRIl, nRIk, 1.0_dp, bd2_blk(1, lam, 1), nrimax*naomax, &
+                                   vblk, nrimax, 1.0_dp, &
+                                   Hflat(hoff(k, l) + (u_img - 1)*slg(l) + (lam - 1)*nAOi*nRIl + 1), nAOi)
+                     END DO
+                     liveH(k, u_img, l) = .TRUE.
+                  END DO
+               END DO
+!$OMP BARRIER
+               IF (ithr == 0) THEN
+                  npct = 10*(ie - live_off(1, i) + 1)/MAX(1, ki_tot)
+                  IF (npct > lpct) THEN
+                     lpct = npct
+                     WRITE (progbuf, '(A,I0,A,I0,A,I0,A,I0)') "KS assembly: T3 build atom ", i, "/", natom, ": ", &
+                        ie - live_off(1, i) + 1, "/", ki_tot
+                     CALL pari_stage_banner(ri_data, TRIM(progbuf))
+                  END IF
+               END IF
+            END DO
+         END DO
+         DEALLOCATE (bd2_blk, vblk)
+!$OMP END PARALLEL
+         WRITE (progbuf, '(A,I0,A,I0,A,F8.1,A)') "KS assembly: T3 build done atom ", i, "/", natom, &
+            " (wall ", m_walltime() - t_stage, " s)"
+         CALL pari_stage_banner(ri_data, TRIM(progbuf))
+         t_stage = m_walltime()
+!$OMP PARALLEL DEFAULT(NONE) &
+!$OMP SHARED(pari_term_mask, i, ri_data, natom, nimg, nao, fimg, reldiff, pair3s, c3norms, Hflat, hoff, slg, liveH, &
+!$OMP        nAOi, offI, fimg_t, pari_diag) &
+!$OMP PRIVATE(jb, j, nAOj, offJ, b_img, k, l, nRIl, nAOl, iu, z1, ithr, nthr)
+         ithr = 0
+         nthr = 1
+!$       ithr = omp_get_thread_num()
+!$       nthr = omp_get_max_threads()
+         DO jb = 1, MERGE(natom*nimg, 0, IAND(pari_term_mask, 4) /= 0)
+            IF (MOD(jb - 1, nthr) /= ithr) CYCLE
+            j = (jb - 1)/nimg + 1
+            b_img = jb - (j - 1)*nimg
+            nAOj = ri_data%bsizes_AO(j)
+            offJ = SUM(ri_data%bsizes_AO(1:j - 1))
+            DO k = 1, natom
+               DO l = 1, natom
+                  nRIl = ri_data%bsizes_RI(l); nAOl = ri_data%bsizes_AO(l)
+                  DO iu = 1, nimg
+                     IF (.NOT. liveH(k, iu, l)) CYCLE
+                     z1 = reldiff(b_img, iu)
+                     IF (z1 <= 0) CYCLE
+                     IF (pair3s(l, j, z1) == 0) CYCLE
+                     IF (c3norms(pair3s(l, j, z1)) <= 1.0E-12_dp) CYCLE
+                     CALL dgemm('N', 'N', nAOi, nAOj, nRIl*nAOl, 1.0_dp, &
+                                Hflat(hoff(k, l) + (iu - 1)*slg(l) + 1), nAOi, &
+                                ri_data%pari_c3(ri_data%pari_c3_offset(pair3s(l, j, z1))), nRIl*nAOl, &
+                                1.0_dp, fimg(offI + 1, offJ + 1, b_img), nao)
+                     ! TODO(dev diagnostic, remove before PR): per-term F
+                     IF (pari_diag) THEN
+                        CALL dgemm('N', 'N', nAOi, nAOj, nRIl*nAOl, 1.0_dp, &
+                                   Hflat(hoff(k, l) + (iu - 1)*slg(l) + 1), nAOi, &
+                                   ri_data%pari_c3(ri_data%pari_c3_offset(pair3s(l, j, z1))), nRIl*nAOl, &
+                                   1.0_dp, fimg_t(offI + 1, offJ + 1, b_img, 3), nao)
+                     END IF
+                  END DO
+               END DO
+            END DO
+         END DO
+!$OMP END PARALLEL
+         DEALLOCATE (Hflat, liveH, slg, hoff)
+         WRITE (progbuf, '(A,I0,A,I0,A,F8.1,A)') "KS assembly: T3 scatter done atom ", i, "/", natom, &
+            " (wall ", m_walltime() - t_stage, " s)"
+         CALL pari_stage_banner(ri_data, TRIM(progbuf))
+
+         ! ================= T4: per (k, x) the bd2 buffer over (z, l) is
+         ! filled once (per-mu GEMMs off the pool) and read as a shifted view:
+         ! V is indexed by v = b - x and the right fit by w = y - b, so
+         ! z = w + v with the implicit y = w + b required to be a valid
+         ! y_list image (the original y walk); the per-(w) contraction folds
+         ! lam into one joint GEMM against the transposed pool copy c3t
+         ki_tot = live_off(natom, i) + live_cnt(natom, i) - live_off(1, i)
+         t_stage = m_walltime()
+!$OMP PARALLEL DEFAULT(NONE) &
+!$OMP SHARED(pari_term_mask, i, ri_data, natom, nimg, nao, npd, nrimax, naomax, cell_to_index, imgcell, live_off, live_cnt, &
+!$OMP        pari_vgate, pari_hard_gate, live_y, live_ip, pd_list, pd_rev, pdiff, reldiff, mimg, ylive, pair3s, c3norms, bd2buf, &
+!$OMP        fimg, c3t, nAOi, offI, ki_tot, fimg_t, f4src_e, f4src_v, f4src_w, pari_diag) &
+!$OMP PRIVATE(k, nRIk, nAOk, offK, ie, x_img, iz, z_img, l, nAOl, offL, mu, jb, j, nRIj, nAOj, offJ, &
+!$OMP        b_img, v_img, w_img, y_img, lam, Gj, vblk, ithr, nthr, npct, lpct, progbuf)
+         ithr = 0
+         nthr = 1
+         lpct = 0
+!$       ithr = omp_get_thread_num()
+!$       nthr = omp_get_max_threads()
+         IF (ALLOCATED (Gj)) DEALLOCATE (Gj)
+         IF (ALLOCATED (vblk)) DEALLOCATE (vblk)
+         ALLOCATE (Gj(naomax*nrimax*naomax))
+         ALLOCATE (vblk(nrimax, nrimax))
+         DO k = 1, natom
+            nRIk = ri_data%bsizes_RI(k); nAOk = ri_data%bsizes_AO(k)
+            offK = SUM(ri_data%bsizes_AO(1:k - 1))
+            DO ie = live_off(k, i), live_off(k, i) + live_cnt(k, i) - 1
+               IF (mimg(live_y(ie)) == 0) CYCLE
+               x_img = mimg(live_y(ie))
+               DO iz = 1, npd
+                  IF (MOD(iz - 1, nthr) /= ithr) CYCLE
+                  z_img = pd_list(iz)
+                  DO l = 1, natom
+                     nAOl = ri_data%bsizes_AO(l)
+                     offL = SUM(ri_data%bsizes_AO(1:l - 1))
+                     DO mu = 1, nAOi
+                        CALL dgemm('N', 'N', nRIk, nAOl, nAOk, 1.0_dp, &
+                                   ri_data%pari_c3(ri_data%pari_c3_offset(live_ip(ie)) + &
+                                                   (mu - 1)*nRIk*nAOk), nRIk, &
+                                   pdiff(offK + 1, offL + 1, z_img), nao, 0.0_dp, &
+                                   bd2buf(1, 1, mu, iz, l), nrimax)
+                     END DO
+                  END DO
+               END DO
+!$OMP BARRIER
+               DO jb = 1, MERGE(natom*nimg, 0, IAND(pari_term_mask, 8) /= 0)
+                  IF (MOD(jb - 1, nthr) /= ithr) CYCLE
+                  j = (jb - 1)/nimg + 1
+                  b_img = jb - (j - 1)*nimg
+                  nRIj = ri_data%bsizes_RI(j); nAOj = ri_data%bsizes_AO(j)
+                  offJ = SUM(ri_data%bsizes_AO(1:j - 1))
+                  v_img = reldiff(b_img, x_img)
+                  IF (v_img <= 0) CYCLE
+                  ! TODO(dev experiment): vacuum-V guard, mirrors the pool prune
+                  IF (SUM(ABS(imgcell(:, v_img))) >= pari_vgate) CYCLE
+                  IF (pair3s(k, j, v_img) == 0) CYCLE
+                  CALL pari_vblock(vblk, ri_data%pari_mat_2c(v_img), k, j, nRIk, nRIj)
+                  IF (SQRT(SUM(vblk(:nRIk, :nRIj)**2)) == 0.0_dp) CYCLE
+                  DO l = 1, natom
+                     nAOl = ri_data%bsizes_AO(l)
+                     DO w_img = 1, nimg
+                        IF (pair3s(j, l, w_img) == 0) CYCLE
+                        IF (c3norms(pair3s(j, l, w_img)) <= 1.0E-12_dp) CYCLE
+                        ! y = w + b must be a valid image AND a y_list image
+                        y_img = pari_imgsum(cell_to_index, imgcell, nimg, imgcell(:, w_img), imgcell(:, b_img))
+                        IF (y_img == 0) CYCLE
+                        IF (.NOT. ylive(y_img)) CYCLE
+                        ! density image z = w + v must be density-live
+                        z_img = pari_imgsum(cell_to_index, imgcell, nimg, imgcell(:, w_img), imgcell(:, v_img))
+                        IF (z_img == 0) CYCLE
+                        iz = pd_rev(z_img)
+                        IF (iz == 0) CYCLE
+                        DO lam = 1, nAOl
+                           CALL dgemm('T', 'N', nAOi, nRIj, nRIk, 1.0_dp, bd2buf(1, lam, 1, iz, l), &
+                                      nrimax*naomax, vblk, nrimax, 0.0_dp, &
+                                      Gj((lam - 1)*nAOi*nRIj + 1), nAOi)
+                        END DO
+                        CALL dgemm('N', 'N', nAOi, nAOj, nRIj*nAOl, 1.0_dp, Gj, nAOi, &
+                                   c3t(ri_data%pari_c3_offset(pair3s(j, l, w_img))), nRIj*nAOl, &
+                                   1.0_dp, fimg(offI + 1, offJ + 1, b_img), nao)
+                        ! TODO(dev diagnostic, remove before PR): per-term + far-chain
+                        IF (pari_diag) THEN
+                           CALL dgemm('N', 'N', nAOi, nAOj, nRIj*nAOl, 1.0_dp, Gj, nAOi, &
+                                      c3t(ri_data%pari_c3_offset(pair3s(j, l, w_img))), nRIj*nAOl, &
+                                      1.0_dp, fimg_t(offI + 1, offJ + 1, b_img, 4), nao)
+                           IF (SUM(ABS(imgcell(:, live_y(ie)))) >= pari_hard_gate) THEN
+                              CALL dgemm('N', 'N', nAOi, nAOj, nRIj*nAOl, 1.0_dp, Gj, nAOi, &
+                                         c3t(ri_data%pari_c3_offset(pair3s(j, l, w_img))), nRIj*nAOl, &
+                                         1.0_dp, f4src_e(offI + 1, offJ + 1, b_img), nao)
+                           END IF
+                           IF (SUM(ABS(imgcell(:, v_img))) >= pari_hard_gate) THEN
+                              CALL dgemm('N', 'N', nAOi, nAOj, nRIj*nAOl, 1.0_dp, Gj, nAOi, &
+                                         c3t(ri_data%pari_c3_offset(pair3s(j, l, w_img))), nRIj*nAOl, &
+                                         1.0_dp, f4src_v(offI + 1, offJ + 1, b_img), nao)
+                           END IF
+                           IF (SUM(ABS(imgcell(:, w_img))) >= pari_hard_gate) THEN
+                              CALL dgemm('N', 'N', nAOi, nAOj, nRIj*nAOl, 1.0_dp, Gj, nAOi, &
+                                         c3t(ri_data%pari_c3_offset(pair3s(j, l, w_img))), nRIj*nAOl, &
+                                         1.0_dp, f4src_w(offI + 1, offJ + 1, b_img), nao)
+                           END IF
+                        END IF
+                     END DO
+                  END DO
+               END DO
+!$OMP BARRIER
+               IF (ithr == 0) THEN
+                  npct = 10*(ie - live_off(1, i) + 1)/MAX(1, ki_tot)
+                  IF (npct > lpct) THEN
+                     lpct = npct
+                     WRITE (progbuf, '(A,I0,A,I0,A,I0,A,I0)') "KS assembly: T4 atom ", i, "/", natom, ": ", &
+                        ie - live_off(1, i) + 1, "/", ki_tot
+                     CALL pari_stage_banner(ri_data, TRIM(progbuf))
+                  END IF
+               END IF
+            END DO
+         END DO
+         DEALLOCATE (Gj, vblk)
+!$OMP END PARALLEL
+         WRITE (progbuf, '(A,I0,A,I0,A,F8.1,A)') "KS assembly: T4 done atom ", i, "/", natom, &
+            " (wall ", m_walltime() - t_stage, " s)"
+         CALL pari_stage_banner(ri_data, TRIM(progbuf))
+
+         ! ================= T2: BD_i . V^b[i,j] . C3(j, l, y-b); V depends on
+         ! the output image b, so no hoist is available (per-(i,j,b) groups);
+         ! the per-(l,y) contraction folds lam into one joint GEMM against c3t
+         t_stage = m_walltime()
+!$OMP PARALLEL DEFAULT(NONE) &
+!$OMP SHARED(pari_term_mask, i, ri_data, natom, nimg, nao, nrimax, naomax, nyl, y_list, bd_all, fimg, reldiff, pair3s, &
+!$OMP        c3norms, c3t, nRIi, nAOi, offI, fimg_t, pari_diag) &
+!$OMP PRIVATE(jb, j, nAOj, nRIj, offJ, b_img, l, nAOl, offL, iy, y_img, z2, lam, vblk, Gj, ithr, nthr)
+         ithr = 0
+         nthr = 1
+!$       ithr = omp_get_thread_num()
+!$       nthr = omp_get_max_threads()
+         IF (ALLOCATED (vblk)) DEALLOCATE (vblk)
+         IF (ALLOCATED (Gj)) DEALLOCATE (Gj)
+         ALLOCATE (vblk(nrimax, nrimax))
+         ALLOCATE (Gj(naomax*nrimax*naomax))
+         DO jb = 1, MERGE(natom*nimg, 0, IAND(pari_term_mask, 2) /= 0)
+            IF (MOD(jb - 1, nthr) /= ithr) CYCLE
+            j = (jb - 1)/nimg + 1
+            b_img = jb - (j - 1)*nimg
+            nAOj = ri_data%bsizes_AO(j); nRIj = ri_data%bsizes_RI(j)
+            offJ = SUM(ri_data%bsizes_AO(1:j - 1))
+            IF (pair3s(i, j, b_img) == 0) CYCLE
+            CALL pari_vblock(vblk, ri_data%pari_mat_2c(b_img), i, j, nRIi, nRIj)
+            IF (SQRT(SUM(vblk(:nRIi, :nRIj)**2)) == 0.0_dp) CYCLE
+            DO l = 1, natom
+               nAOl = ri_data%bsizes_AO(l)
+               offL = SUM(ri_data%bsizes_AO(1:l - 1))
+               DO iy = 1, nyl
+                  y_img = y_list(iy)
+                  z2 = reldiff(y_img, b_img)
+                  IF (z2 <= 0) CYCLE
+                  IF (pair3s(j, l, z2) == 0) CYCLE
+                  IF (c3norms(pair3s(j, l, z2)) <= 1.0E-12_dp) CYCLE
+                  DO lam = 1, nAOl
+                     CALL dgemm('T', 'N', nAOi, nRIj, nRIi, 1.0_dp, bd_all(1, 1, offL + lam, y_img), nRIi, &
+                                vblk, nrimax, 0.0_dp, Gj((lam - 1)*nAOi*nRIj + 1), nAOi)
+                  END DO
+                  CALL dgemm('N', 'N', nAOi, nAOj, nRIj*nAOl, 1.0_dp, Gj, nAOi, &
+                             c3t(ri_data%pari_c3_offset(pair3s(j, l, z2))), nRIj*nAOl, &
+                             1.0_dp, fimg(offI + 1, offJ + 1, b_img), nao)
+                  ! TODO(dev diagnostic, remove before PR): per-term F
+                  IF (pari_diag) THEN
+                     CALL dgemm('N', 'N', nAOi, nAOj, nRIj*nAOl, 1.0_dp, Gj, nAOi, &
+                                c3t(ri_data%pari_c3_offset(pair3s(j, l, z2))), nRIj*nAOl, &
+                                1.0_dp, fimg_t(offI + 1, offJ + 1, b_img, 2), nao)
+                  END IF
+               END DO
+            END DO
+         END DO
+         DEALLOCATE (vblk, Gj)
+!$OMP END PARALLEL
+         WRITE (progbuf, '(A,I0,A,I0,A,F8.1,A)') "KS assembly: T2 done atom ", i, "/", natom, &
+            " (wall ", m_walltime() - t_stage, " s)"
+         CALL pari_stage_banner(ri_data, TRIM(progbuf))
+
+         DEALLOCATE (bd_all)
+      END DO
+      DEALLOCATE (vblk, bd2_blk, Gj, y_list, ylive, pd_list, pd_rev, bd2buf, c3t)
+
+      ! symmetrize the image pairs: the exact exchange satisfies F^b = (F^-b)^T,
+      ! so any deviation is error (from one-sided screening or from noise of the
+      ! per-pair truncated solves amplified by pair-domain near-null spaces);
+      ! projecting onto the constraint manifold halves it and restores a
+      ! Hermitian k-space Fock. Output images whose mirror lies outside the HFX
+      ! image range are voided: keeping them one-sided is energy-invisible (S1
+      ! already voids the matching density images), but breaks the Hermiticity
+      ! of F(k) = sum_b F^b exp(ikR_b) and poisons the eigensolver
+      DO b_img = 1, nimg
+         IF (mimg(b_img) > b_img) THEN
+            ptmp(:, :) = 0.5_dp*(fimg(:, :, b_img) + TRANSPOSE(fimg(:, :, mimg(b_img))))
+            fimg(:, :, mimg(b_img)) = 0.5_dp*(fimg(:, :, mimg(b_img)) + TRANSPOSE(fimg(:, :, b_img)))
+            fimg(:, :, b_img) = ptmp(:, :)
+         ELSE IF (mimg(b_img) == b_img) THEN
+            fimg(:, :, b_img) = 0.5_dp*(fimg(:, :, b_img) + TRANSPOSE(fimg(:, :, b_img)))
+         ELSE IF (mimg(b_img) == 0) THEN
+            fimg(:, :, b_img) = 0.0_dp
+         END IF
+      END DO
+
+      ! structural identity F^b == (F^{-b})^T
+      worst_sym = 0.0_dp
+      DO b_img = 1, nimg
+         IF (mimg(b_img) > 0) THEN
+            worst_sym = MAX(worst_sym, &
+                            SQRT(SUM((fimg(:, :, b_img) - TRANSPOSE(fimg(:, :, mimg(b_img))))**2))/ &
+                            MAX(SQRT(SUM(fimg(:, :, b_img)**2)), 1.0E-30_dp))
+         END IF
+      END DO
+      IF (worst_sym > 1.0E-10_dp) THEN
+         CALL cp_warn(__LOCATION__, "PARI KS assembly: image symmetry F^b = (F^-b)^T violated "// &
+                      "beyond 1e-10 (check the image algebra)")
+      END IF
+
+      !TODO(dev dump, remove before PR): per-image F, per-term F + symmetry, full P, V blocks
+      OPEN (NEWUNIT=unit_dump, FILE="PARI_K_DUMP")
+      WRITE (unit_dump, *) nimg, nao, worst_sym
+      WRITE (unit_dump, *) imgcell
+      DO b_img = 1, nimg
+         WRITE (unit_dump, *) b_img
+         WRITE (unit_dump, '(ES25.16)') pdiff(:, :, b_img)
+      END DO
+      DO b_img = 1, nimg
+         WRITE (unit_dump, *) b_img
+         WRITE (unit_dump, '(ES25.16)') fimg(:, :, b_img)
+      END DO
+      ! TODO(dev diagnostic, remove before PR): per-term sections only with
+      ! PARI_KEEP_DIAG (the pdiff/fimg sections above stay -- regression channel)
+      IF (pari_diag) THEN
+         DO ip = 1, 4
+            worst_sym = 0.0_dp
+            DO b_img = 1, nimg
+               IF (mimg(b_img) > 0) THEN
+                  worst_sym = MAX(worst_sym, &
+                                  SQRT(SUM((fimg_t(:, :, b_img, ip) - TRANSPOSE(fimg_t(:, :, mimg(b_img), ip)))**2))/ &
+                                  MAX(SQRT(SUM(fimg_t(:, :, b_img, ip)**2)), 1.0E-30_dp))
+               END IF
+            END DO
+            WRITE (unit_dump, *) ip
+            WRITE (unit_dump, '(ES25.16)') worst_sym
+            DO b_img = 1, nimg
+               WRITE (unit_dump, *) b_img
+               WRITE (unit_dump, '(ES25.16)') fimg_t(:, :, b_img, ip)
+            END DO
+         END DO
+      END IF
+      CLOSE (unit_dump)
+
+      ! energy, legacy convention: 0.5 sum_b Tr((-fac F^b) P^b)
+      ehfx = 0.0_dp
+      DO b_img = 1, nimg
+         trb = SUM(fimg(:, :, b_img)*pdiff(:, :, b_img))
+         ehfx = ehfx - 0.5_dp*fac*trb
+      END DO
+
+      ! accumulate -fac F^b into the symmetric-typed KS image matrices, upper
+      ! blocks only, following the storage parity convention (same rule the
+      ! legacy fold implements via checker_tr): even atom pairs store the
+      ! block of image z at z; odd pairs store it at the NEGATED cell, i.e.
+      ! the (a, b) block of image z carries F(a@0, b@-c_z), which by
+      ! F^b = (F^-b)^T equals the (a, b) block of the opposite image
+      DO b_img = 1, nimg
+         DO Aat = 1, natom
+            DO Bat = Aat, natom
+               offI = SUM(ri_data%bsizes_AO(1:Aat - 1)); nAOi = ri_data%bsizes_AO(Aat)
+               offJ = SUM(ri_data%bsizes_AO(1:Bat - 1)); nAOj = ri_data%bsizes_AO(Bat)
+               src = b_img
+               IF (MOD(Aat + Bat, 2) /= 0) src = mimg(b_img)
+               IF (src == 0) CYCLE
+               CALL dbcsr_put_block(ks_matrix(1, b_img)%matrix, Aat, Bat, &
+                                    -fac*fimg(offI + 1:offI + nAOi, offJ + 1:offJ + nAOj, src))
+            END DO
+         END DO
+      END DO
+
+      ! TODO(dev diagnostic, remove before PR): far-output (cell norm >= 3)
+      ! content split by chain source: T1 via |y| (BD/V side) or |z1| (right
+      ! factor), T4 via |e| (BD2), |v| (V) or |w| (right factor)
+      IF (pari_diag) THEN
+         d1y = 0.0_dp; d1z = 0.0_dp; d4e = 0.0_dp; d4v = 0.0_dp; d4w = 0.0_dp
+         DO b_img = 1, nimg
+            IF (SUM(ABS(imgcell(:, b_img))) < 3) CYCLE
+            d1y = d1y + SUM(f1src_y(:, :, b_img)**2)
+            d1z = d1z + SUM(f1src_z(:, :, b_img)**2)
+            d4e = d4e + SUM(f4src_e(:, :, b_img)**2)
+            d4v = d4v + SUM(f4src_v(:, :, b_img)**2)
+            d4w = d4w + SUM(f4src_w(:, :, b_img)**2)
+         END DO
+         WRITE (*, '(A,5ES13.4)') " PARI-DIAG| far-img source sq-norms T1(y),T1(z1),T4(e),T4(v),T4(w): ", &
+            SQRT(d1y), SQRT(d1z), SQRT(d4e), SQRT(d4v), SQRT(d4w)
+         DEALLOCATE (f1src_y, f1src_z, f4src_e, f4src_v, f4src_w)
+      END IF
+
+      IF (ALLOCATED(fimg_t)) DEALLOCATE (fimg_t)
+      DEALLOCATE (fimg, pdiff, pdiff_norm, pair3, pair3s, mimg, reldiff, ptmp, live_cnt, live_off, &
+                  live_y, live_ip, imgcell, c3norm, c3norms)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE pari_assemble_ks
+
+
+! **************************************************************************************************
+!> \brief stage banner for the PARI k-point twin: goes to unit_nr when active,
+!>        otherwise to stdout only when the KP_RI_PROGRESS_BAR print flag is on
+! **************************************************************************************************
+   SUBROUTINE pari_stage_banner(ri_data, msg)
+      TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
+      CHARACTER(LEN=*), INTENT(IN)                       :: msg
+
+      ! unit_nr comes from the HF_INFO print key (default level MEDIUM):
+      ! silent at LOW, prints from MEDIUM upward, like the legacy KP banners
+      IF (ri_data%unit_nr > 0) THEN
+         WRITE (ri_data%unit_nr, '(T3,A,A)') "PARI| ", msg
+         CALL m_flush(ri_data%unit_nr)
+      END IF
+   END SUBROUTINE pari_stage_banner
+
+! **************************************************************************************************
+!> \brief index of the image at cell ca+cb, 0 when outside the k-point cell
+!>        list or beyond the HFX image range
+! **************************************************************************************************
+   FUNCTION pari_imgsum(cell_to_index, imgcell, nimg, ca, cb) RESULT(img)
+      INTEGER, DIMENSION(:, :, :), POINTER              :: cell_to_index
+      INTEGER, DIMENSION(:, :), INTENT(IN)              :: imgcell
+      INTEGER, INTENT(IN)                               :: nimg
+      INTEGER, DIMENSION(3), INTENT(IN)                 :: ca, cb
+      INTEGER                                           :: img
+
+      INTEGER, DIMENSION(3)                             :: cc
+
+      cc = ca + cb
+      IF (cc(1) >= LBOUND(cell_to_index, 1) .AND. cc(1) <= UBOUND(cell_to_index, 1) .AND. &
+          cc(2) >= LBOUND(cell_to_index, 2) .AND. cc(2) <= UBOUND(cell_to_index, 2) .AND. &
+          cc(3) >= LBOUND(cell_to_index, 3) .AND. cc(3) <= UBOUND(cell_to_index, 3)) THEN
+         img = cell_to_index(cc(1), cc(2), cc(3))
+         IF (img > nimg .OR. img < 1) img = 0
+      ELSE
+         img = 0
+      END IF
+   END FUNCTION pari_imgsum
+
+! **************************************************************************************************
+!> \brief copy the (rowat, colat) block of a per-image 2c matrix into vblk,
+!>        zeroing it when the block is absent (screened image pair)
+! **************************************************************************************************
+   SUBROUTINE pari_vblock(vblk, mat2c, rowat, colat, nr, nc)
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(OUT)       :: vblk
+      TYPE(dbcsr_type), INTENT(INOUT)                   :: mat2c
+      INTEGER, INTENT(IN)                               :: rowat, colat, nr, nc
+
+      LOGICAL                                           :: found
+      REAL(KIND=dp), DIMENSION(:, :), POINTER           :: blk
+
+      NULLIFY (blk)
+      CALL dbcsr_get_block_p(matrix=mat2c, row=rowat, col=colat, block=blk, found=found)
+      IF (found) THEN
+         vblk(1:nr, 1:nc) = blk(1:nr, 1:nc)
+      ELSE
+         vblk(1:nr, 1:nc) = 0.0_dp
+      END IF
+   END SUBROUTINE pari_vblock
+
+! **************************************************************************************************
 !> \brief PARI pre-SCF: build the per-image 2c metric, stream the 3c integrals
 !>        through per-pair domain solves, and cache the pooled fit coefficients.
-!>        Twin of hfx_ri_pre_scf_kp (hfx_ri_kp.F), but the RI direction is never
-!>        extended over ncell_RI cells: all aux functions live in their main cell,
-!>        and the per-atom global (bumped) metric inverse is replaced by the
-!>        per-pair truncated pseudo-inverse.
+!>        Twin of hfx_ri_pre_scf_kp (hfx_ri_kp.F): the 3c tensor carries the
+!>        extended per-image RI blocks of get_kp_and_ri_images, but PARI only
+!>        ever reads the home-cell block (index katom), and the per-atom global
+!>        (bumped) metric inverse is replaced by the per-pair truncated
+!>        pseudo-inverse.
 !> \param dbcsr_template ...
 !> \param ri_data ...
 !> \param qs_env ...
@@ -196,16 +1203,18 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'hfx_ri_pre_scf_kp_pari'
 
-      INTEGER :: handle, i_img, iatom, jatom, natom, nkind, nimg, npair
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: img_to_RI_cell_pari, pair_i, pair_img, &
-                                                            pair_j
+      INTEGER :: handle, i_RI, i_img, iatom, ienv, jatom, natom, ncell_RI_pari, nkind, nimg, npair
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: bsizes_RI_ext, edist_1, edist_2, &
+                                                            edist_3, img_to_RI_cell_pari, pair_i, &
+                                                            pair_img, pair_j
+      LOGICAL :: qexist
       INTEGER, DIMENSION(:), POINTER                     :: col_bsize, row_bsize
       INTEGER, DIMENSION(3)                              :: pdims, pcoord
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: blk_2c
       TYPE(dbcsr_iterator_type)                          :: iter_2c
       TYPE(dbcsr_distribution_type)                      :: dbcsr_dist
       TYPE(dbcsr_type), ALLOCATABLE, DIMENSION(:)        :: t_2c_pari
-      TYPE(dbt_type)                                     :: t_3c_dummy
+      TYPE(dbt_type)                                     :: t_3c_dummy, t_3c_dummy_ext
       TYPE(dbt_type), ALLOCATABLE, DIMENSION(:, :)       :: t_3c_pari
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(distribution_2d_type), POINTER                :: dist_2d
@@ -217,6 +1226,12 @@ CONTAINS
       TYPE(neighbor_list_3c_type)                         :: nl_3c
       TYPE(dbt_pgrid_type)                               :: pgrid
       TYPE(dbt_distribution_type)                        :: t_dist
+      ! TODO(dev dump, remove before PR): RI_range runtime knob
+      LOGICAL                                            :: qexist_ri
+      REAL(KIND=dp)                                      :: ri_range_prv = 1.0E-6_dp
+      ! TODO(dev dump, remove before PR): V dump unit + view buffer
+      INTEGER                                            :: unit_dump
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: vblk
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: dist_1, dist_2, dist_3
@@ -269,6 +1284,7 @@ CONTAINS
       DEALLOCATE (row_bsize, col_bsize)
       CALL dbcsr_distribution_release(dbcsr_dist)
 
+      CALL pari_stage_banner(ri_data, "building per-image 2c metric integrals")
       CALL build_2c_integrals(t_2c_pari, ri_data%filter_eps_2c, qs_env, nl_2c, basis_set_RI, &
                               basis_set_RI, ri_data%hfx_pot, do_kpoints=.TRUE., do_hfx_kpoints=.TRUE.)
       CALL release_neighbor_list_sets(nl_2c)
@@ -279,13 +1295,55 @@ CONTAINS
       END DO
 
       ! ---------------------------------------------------------------- 3c: (mu^0 nu^b | P^0) per image
-      ! plain (non-extended) RI direction: img_to_RI_cell maps every image to the
-      ! main cell, so the builder folds all aux functions into main-cell blocks
+      ! aux-cell placement: get_kp_and_ri_images has already flagged the images
+      ! hosting RI functions within kp_RI_range (ri_data%img_to_RI_cell, an
+      ! extended basis of ri_data%ncell_RI cells). Folding every image into the
+      ! main cell (the legacy hard-wire below) makes build_3c_integrals alias
+      ! all aux images into the main-cell block and SUM them there
+      ! (dbt_put_block summation=.TRUE.), so the tensor held
+      ! sum_c (mu^0 nu^b | P_k^c) instead of the home-only (P_k^0) -- a
+      ! cell-size dependent contamination of every pair solve. With the
+      ! extended mapping the home block index stays (1-1)*natom + katom =
+      ! katom, so all PARI reads are unchanged and clean
+      ! TODO(dev experiment, remove before PR): PARI_RI_MODE file, 0 = legacy
+      INQUIRE (FILE="PARI_RI_MODE", EXIST=qexist)
+      IF (qexist) THEN
+         OPEN (NEWUNIT=ienv, FILE="PARI_RI_MODE", status="old", action="read")
+         READ (ienv, *) pari_ri_mode
+         CLOSE (ienv)
+      END IF
       ALLOCATE (img_to_RI_cell_pari(nimg))
-      img_to_RI_cell_pari(:) = 1
+      IF (pari_ri_mode == 0) THEN
+         img_to_RI_cell_pari(:) = 1
+         ncell_RI_pari = 1
+      ELSE
+         ! element-wise copy: ri_data%img_to_RI_cell is allocated with
+         ! dft_control%nimages entries, which exceeds ri_data%nimg -- a whole-
+         ! array assignment memcpy's the source length and overruns.
+         ! Unflagged images (aux beyond kp_RI_range per the shared detection)
+         ! get a private dead block: the 3c builder's looser, kind-radius based
+         ! screening can still reach them, and a zero mapping there would make
+         ! blk_idx(3) nonpositive; their out-of-range content lands in the dead
+         ! block, is filtered away, and is never read (PARI reads home blocks)
+         ncell_RI_pari = ri_data%ncell_RI
+         DO i_img = 1, nimg
+            img_to_RI_cell_pari(i_img) = ri_data%img_to_RI_cell(i_img)
+            IF (img_to_RI_cell_pari(i_img) == 0) THEN
+               ncell_RI_pari = ncell_RI_pari + 1
+               img_to_RI_cell_pari(i_img) = ncell_RI_pari
+            END IF
+         END DO
+      END IF
 
       pdims = 0
-      CALL dbt_pgrid_create(para_env, pdims, pgrid, tensor_dims=[natom, natom, 1])
+      ! tensor_dims should reflect the real block structure of the 3c tensor
+      ! (GLOBAL practice, hfx_ri_kp.F); legacy keeps the historical value for
+      ! bitwise reproduction
+      IF (pari_ri_mode == 0) THEN
+         CALL dbt_pgrid_create(para_env, pdims, pgrid, tensor_dims=[natom, natom, 1])
+      ELSE
+         CALL dbt_pgrid_create(para_env, pdims, pgrid, tensor_dims=[natom, natom, natom*ncell_RI_pari])
+      END IF
 
       CALL create_3c_tensor(t_3c_dummy, dist_1, dist_2, dist_3, pgrid, &
                             ri_data%bsizes_AO, ri_data%bsizes_AO, ri_data%bsizes_RI, &
@@ -301,20 +1359,56 @@ CONTAINS
                                    own_dist=.TRUE.)
 
       ALLOCATE (t_3c_pari(nimg, 1))
-      CALL dbt_distribution_new(t_dist, pgrid, dist_1, dist_2, dist_3)
-      CALL dbt_create(t_3c_pari(1, 1), "PARI_3c_ints", t_dist, [1, 2], [3], &
-                      ri_data%bsizes_AO, ri_data%bsizes_AO, ri_data%bsizes_RI)
+      IF (pari_ri_mode == 0) THEN
+         CALL dbt_distribution_new(t_dist, pgrid, dist_1, dist_2, dist_3)
+         CALL dbt_create(t_3c_pari(1, 1), "PARI_3c_ints", t_dist, [1, 2], [3], &
+                         ri_data%bsizes_AO, ri_data%bsizes_AO, ri_data%bsizes_RI)
+      ELSE
+         ! extended per-image RI blocks: the tensor's third dimension spans
+         ! ncell_RI_pari cells of aux functions; neighbor-aux contributions
+         ! land in their own blocks and are filtered away unread
+         ALLOCATE (bsizes_RI_ext(natom*ncell_RI_pari))
+         DO i_RI = 1, ncell_RI_pari
+            bsizes_RI_ext((i_RI - 1)*natom + 1:i_RI*natom) = ri_data%bsizes_RI(:)
+         END DO
+         CALL create_3c_tensor(t_3c_dummy_ext, edist_1, edist_2, edist_3, pgrid, &
+                               ri_data%bsizes_AO, ri_data%bsizes_AO, bsizes_RI_ext, &
+                               map1=[1, 2], map2=[3], name="(AO AO | RI ext) PARI")
+         CALL dbt_destroy(t_3c_dummy_ext)
+         CALL dbt_distribution_new(t_dist, pgrid, edist_1, edist_2, edist_3)
+         CALL dbt_create(t_3c_pari(1, 1), "PARI_3c_ints", t_dist, [1, 2], [3], &
+                         ri_data%bsizes_AO, ri_data%bsizes_AO, bsizes_RI_ext)
+         DEALLOCATE (edist_1, edist_2, edist_3, bsizes_RI_ext)
+      END IF
       DO i_img = 2, nimg
          CALL dbt_create(t_3c_pari(1, 1), t_3c_pari(i_img, 1))
       END DO
       CALL dbt_distribution_destroy(t_dist)
       DEALLOCATE (dist_1, dist_2, dist_3)
 
+      CALL pari_stage_banner(ri_data, "building per-image 3c integrals (the slow stage)")
+      ! TODO(dev experiment, remove before PR): RI_range runtime knob
+      ! (default eps = home-only; file restores the legacy kp_RI_range).
+      ! The home-aux tuples carry positive roundoff in rik (~4 ulp, the
+      ! iterator composes it), so the cut must be a small positive epsilon,
+      ! not exact zero: the builder's gate is a strict dik > RI_range
+      ri_range_prv = 1.0E-6_dp
+      INQUIRE (FILE="PARI_RI_RANGE", EXIST=qexist_ri)
+      IF (qexist_ri) THEN
+         OPEN (NEWUNIT=ienv, FILE="PARI_RI_RANGE", status="old", action="read")
+         READ (ienv, *) ri_range_prv
+         CLOSE (ienv)
+      END IF
       CALL build_3c_integrals(t_3c_pari, ri_data%filter_eps, qs_env, nl_3c, basis_set_AO, &
                               basis_set_AO, basis_set_RI, ri_data%ri_metric, &
                               int_eps=ri_data%eps_schwarz, op_pos=2, desymmetrize=.FALSE., &
                               do_kpoints=.TRUE., do_hfx_kpoints=.TRUE., &
-                              RI_range=ri_data%kp_RI_range, img_to_RI_cell=img_to_RI_cell_pari)
+                              ! every 3c read site contracts the home aux block only
+                              ! (katom == first AO atom, dik within roundoff of zero),
+                              ! so a tiny RI_range keeps every consumed block while the
+                              ! builder skips far-aux images (~40x fewer 3c blocks in 2D/3D);
+                              ! the knob above restores the legacy range for A/B
+                              RI_range=ri_range_prv, img_to_RI_cell=img_to_RI_cell_pari)
       DO i_img = 1, nimg
          CALL dbt_filter(t_3c_pari(i_img, 1), ri_data%filter_eps)
       END DO
@@ -356,6 +1450,7 @@ CONTAINS
       END DO
 
       ! stream the 3c integrals through the per-pair solves and discard them
+      CALL pari_stage_banner(ri_data, "solving pair domains")
       CALL pari_solve_pairs(ri_data, qs_env, t_2c_pari, t_3c_pari, pair_i, pair_j, pair_img)
 
       DO i_img = 1, nimg
@@ -384,6 +1479,25 @@ CONTAINS
             "PARI| Worst pair-domain reciprocal condition number: ", ri_data%pari_rcond_max
          CALL m_flush(ri_data%unit_nr)
       END IF
+
+      !TODO(dev dump, remove before PR): all nonzero V blocks (pari_vblock
+      ! view), written once here -- the pair metric is fixed after pre-SCF
+      ALLOCATE (vblk(MAXVAL(ri_data%bsizes_RI), MAXVAL(ri_data%bsizes_RI)))
+      OPEN (NEWUNIT=unit_dump, FILE="PARI_V_DUMP")
+      DO i_img = 1, nimg
+         DO iatom = 1, natom
+            DO jatom = 1, natom
+               CALL pari_vblock(vblk, ri_data%pari_mat_2c(i_img), iatom, jatom, &
+                                ri_data%bsizes_RI(iatom), ri_data%bsizes_RI(jatom))
+               IF (SQRT(SUM(vblk(:ri_data%bsizes_RI(iatom), :ri_data%bsizes_RI(jatom))**2)) > 0.0_dp) THEN
+                  WRITE (unit_dump, *) i_img, iatom, jatom
+                  WRITE (unit_dump, '(ES25.16)') vblk(:ri_data%bsizes_RI(iatom), :ri_data%bsizes_RI(jatom))
+               END IF
+            END DO
+         END DO
+      END DO
+      CLOSE (unit_dump)
+      DEALLOCATE (vblk)
 
       CALL timestop(handle)
 
@@ -440,13 +1554,16 @@ CONTAINS
       INTEGER, DIMENSION(:), INTENT(IN)                  :: pair_i, pair_j, pair_img
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'pari_solve_pairs'
+      CHARACTER(LEN=64)                                  :: progbuf, progmsg
+      REAL(KIND=dp)                                      :: t_stage
 
-      INTEGER :: b_img, cell(3), handle, i, iatom, ipair, jatom, l, mb_img, nAOi, nAOj, ncol, ndom, &
-                 ni, nj, npair, offset, unit_dump
+      INTEGER :: b_img, cell(3), handle, i, iatom, ienv, ipair, ithr, jatom, l, mb_img, nAOi, nAOj, ncol, ndom, &
+                 ni, nj, npair, nthr, offset, unit_dump, unit_pool
       INTEGER, DIMENSION(3)                              :: ind
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: img_to_mimg
-      LOGICAL                                            :: found, same_site
+      INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: img_cells
+      LOGICAL                                            :: found, qexist, same_site
       REAL(KIND=dp)                                      :: rcond
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: a2, c_full, vdom, vinv
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: blk_3c
@@ -465,19 +1582,31 @@ CONTAINS
       ! image index of the opposite cell -b for every image b (the k-cell box is symmetric)
       ALLOCATE (img_to_mimg(ri_data%nimg))
       img_to_mimg = 0
+      ALLOCATE (img_cells(3, ri_data%nimg))
+      img_cells = 0
       DO b_img = 1, ri_data%nimg
+         found = .FALSE.
          cell = 0
          DO i = LBOUND(cell_to_index, 1), UBOUND(cell_to_index, 1)
             DO jatom = LBOUND(cell_to_index, 2), UBOUND(cell_to_index, 2)
                DO l = LBOUND(cell_to_index, 3), UBOUND(cell_to_index, 3)
-                  IF (cell_to_index(i, jatom, l) == b_img) cell = [i, jatom, l]
+                  IF (cell_to_index(i, jatom, l) == b_img) THEN
+                     cell = [i, jatom, l]
+                     found = .TRUE.
+                  END IF
                END DO
             END DO
          END DO
-         IF (ANY(cell /= 0)) THEN
+         ! the main cell is [0, 0, 0], so emptiness must not be probed via
+         ! ANY(cell /= 0) -- that silently zeroed the partner rows of every
+         ! main-image pair (img_to_mimg(1) == 0) and blew up their C3 solves
+         IF (found) THEN
             i = cell_to_index(-cell(1), -cell(2), -cell(3))
             IF (i >= 1 .AND. i <= ri_data%nimg) img_to_mimg(b_img) = i
          END IF
+         ! TODO(dev experiment, remove before PR): store the cell vector for
+         ! the distance prune of physically empty far pairs
+         IF (found) img_cells(:, b_img) = cell
       END DO
 
       ALLOCATE (ri_data%pari_c3_offset(npair + 1))
@@ -491,9 +1620,49 @@ CONTAINS
       ALLOCATE (ri_data%pari_nrow_i(npair))
       ri_data%pari_nrow_i(:) = ri_data%bsizes_RI(pair_i(:))
 
+      ! TODO(dev experiment, remove before PR): runtime remote-cut knob
+      INQUIRE (FILE="PARI_REMOTE_CUT", EXIST=qexist)
+      IF (qexist) THEN
+         OPEN (NEWUNIT=ienv, FILE="PARI_REMOTE_CUT", status="old", action="read")
+         READ (ienv, *) pari_remote_cut
+         CLOSE (ienv)
+      END IF
+      ! TODO(dev experiment, remove before PR): eig truncation knob
+      INQUIRE (FILE="PARI_EPS_EIG", EXIST=qexist)
+      IF (qexist) THEN
+         OPEN (NEWUNIT=ienv, FILE="PARI_EPS_EIG", status="old", action="read")
+         READ (ienv, *) pari_eps_eig
+         CLOSE (ienv)
+      END IF
+      ! TODO(dev experiment, remove before PR): same-atom cross-image pair scaling
+      INQUIRE (FILE="PARI_SAC_F", EXIST=qexist)
+      IF (qexist) THEN
+         OPEN (NEWUNIT=ienv, FILE="PARI_SAC_F", status="old", action="read")
+         READ (ienv, *) pari_sac_f
+         CLOSE (ienv)
+      END IF
       !TODO(dev dump, remove before PR): C3 pool dump for the pyscf oracle gate
       IF (para_env%mepos == para_env%num_pe - 1) OPEN (NEWUNIT=unit_dump, FILE="PARI_C3_DUMP")
+      IF (para_env%mepos == para_env%num_pe - 1) OPEN (NEWUNIT=unit_pool, FILE="PARI_POOL_DUMP")
+      progmsg = ""
+!$OMP PARALLEL DEFAULT(NONE) &
+!$OMP SHARED(ri_data, t_2c_pari, t_3c_pari, pair_i, pair_j, pair_img, npair, img_to_mimg, img_cells, para_env, &
+!$OMP        unit_dump, unit_pool, progmsg, pari_remote_cut, pari_sac_f, pari_eps_eig) &
+!$OMP PRIVATE(ipair, iatom, jatom, b_img, mb_img, same_site, ni, nj, nAOi, nAOj, ncol, ndom, offset, &
+!$OMP         ind, found, rcond, vdom, a2, c_full, vinv, blk_3c, vii, vij, vjj, progbuf, ithr, nthr)
+      ithr = 0
+      nthr = 1
+!$    ithr = omp_get_thread_num()
+!$    nthr = omp_get_max_threads()
       DO ipair = 1, npair
+         IF (MOD(ipair - 1, nthr) /= ithr) CYCLE
+         IF (MOD(ipair, MAX(1, npair/20)) == 0) THEN
+!$OMP CRITICAL(pari_banner)
+            WRITE (progbuf, '(I0,A,I0)') ipair, " / ", npair
+            progmsg = "pair solves: "//TRIM(progbuf)
+            CALL pari_stage_banner(ri_data, progmsg)
+!$OMP END CRITICAL(pari_banner)
+         END IF
          iatom = pair_i(ipair)
          jatom = pair_j(ipair)
          b_img = pair_img(ipair)
@@ -554,26 +1723,114 @@ CONTAINS
             DEALLOCATE (blk_3c)
          END IF
 
-         CALL pari_pair_pinv(vdom, pari_eps_eig, vinv, rcond)
-         ri_data%pari_rcond_max = MAX(ri_data%pari_rcond_max, rcond)
-         c_full = MATMUL(vinv, a2)
-         IF (same_site) c_full = 0.5_dp*c_full
+         IF (SQRT(SUM(a2**2)) < 1.0E-8_dp .OR. SUM(ABS(img_cells(:, b_img))) >= pari_remote_cut) THEN
+            ! dead or remote pair: the 3c products are overlap-dead (exactly
+            ! zero, or pure integral-engine roundoff on a physically empty
+            ! pair), or the pair cell lies beyond any orbital overlap at this
+            ! range separation; feeding roundoff into the truncated inverse
+            ! amplifies it by the near-null modes into spurious pool entries,
+            ! so such pairs are skipped and the pooled C3 stays zero
+            c_full = 0.0_dp
+         ELSE
+            CALL pari_pair_pinv(vdom, pari_eps_eig, vinv, rcond)
+!$OMP CRITICAL(pari_rcond_max)
+            ri_data%pari_rcond_max = MAX(ri_data%pari_rcond_max, rcond)
+!$OMP END CRITICAL(pari_rcond_max)
+            c_full = MATMUL(vinv, a2)
+            IF (same_site) c_full = 0.5_dp*c_full
+            IF (iatom == jatom .AND. b_img /= 1) c_full = pari_sac_f*c_full
+         END IF
          ri_data%pari_c3(offset + 1:offset + ni*ncol) = RESHAPE(c_full(1:ni, :), [ni*ncol])
          !TODO(dev dump, remove before PR): main-cell pairs only (the pyscf oracle
-         ! gate compares the molecular, i.e. same-cell, pair domains)
-         IF (para_env%mepos == para_env%num_pe - 1 .AND. b_img == 1) THEN
-            WRITE (unit_dump, *) iatom, jatom, b_img, ni, nAOi, nAOj, MERGE(1, 0, same_site)
-            WRITE (unit_dump, '(ES25.16)') vdom
-            WRITE (unit_dump, '(ES25.16)') c_full(1:ni, :)
+         ! gate compares the molecular, i.e. same-cell, pair domains); a2 = the raw
+         ! 3c rows fed to the pseudo-inverse, for the null-projection audit
+         IF (para_env%mepos == para_env%num_pe - 1) THEN
+!$OMP CRITICAL(pari_c3_dump)
+            IF (SUM(ABS(img_cells(:, b_img))) <= 1) THEN
+               WRITE (unit_dump, *) iatom, jatom, b_img, ni, nAOi, nAOj, MERGE(1, 0, same_site)
+               WRITE (unit_dump, '(ES25.16)') vdom
+               WRITE (unit_dump, '(ES25.16)') c_full
+               WRITE (unit_dump, '(ES25.16)') a2
+            END IF
+            WRITE (unit_pool, *) iatom, jatom, b_img, ni, nAOi, nAOj
+            WRITE (unit_pool, '(ES25.16)') c_full(1:ni, :)
+!$OMP END CRITICAL(pari_c3_dump)
          END IF
          DEALLOCATE (vdom, a2, c_full, vinv)
       END DO
+!$OMP END PARALLEL
       IF (para_env%mepos == para_env%num_pe - 1) CLOSE (unit_dump)
+      IF (para_env%mepos == para_env%num_pe - 1) CLOSE (unit_pool)
 
-      DEALLOCATE (img_to_mimg)
+      DEALLOCATE (img_to_mimg, img_cells)
       CALL timestop(handle)
 
    END SUBROUTINE pari_solve_pairs
+
+
+! **************************************************************************************************
+!> \brief gather the pooled C3 blocks of atom iat into (ndom, nAO_iat, nao)
+! **************************************************************************************************
+   SUBROUTINE pari_gather_c3(ri_data, pair_map, iat, c3)
+      TYPE(hfx_ri_type), INTENT(IN)                     :: ri_data
+      INTEGER, DIMENSION(:, :), INTENT(IN)              :: pair_map
+      INTEGER, INTENT(IN)                               :: iat
+      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(OUT)    :: c3
+
+      INTEGER :: j, nAOi, nAOj, offq, pair_ab
+
+      nAOi = SIZE(c3, 2)
+      c3 = 0.0_dp
+      DO j = 1, SIZE(pair_map, 2)
+         pair_ab = pair_map(iat, j)
+         CPASSERT(pair_ab > 0)
+         offq = SUM(ri_data%bsizes_AO(1:j - 1))
+         nAOj = ri_data%bsizes_AO(j)
+         c3(1:SIZE(c3, 1), 1:nAOi, offq + 1:offq + nAOj) = RESHAPE( &
+            ri_data%pari_c3(ri_data%pari_c3_offset(pair_ab):ri_data%pari_c3_offset(pair_ab + 1) - 1), &
+            [SIZE(c3, 1), nAOi, nAOj])
+      END DO
+   END SUBROUTINE pari_gather_c3
+
+! **************************************************************************************************
+!> \brief src(a,b,c) -> dst(a*c, b) with (a,c) merged in the source scan order
+! **************************************************************************************************
+   SUBROUTINE pari_transpose_213(src, dst)
+      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(IN)      :: src
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(OUT)        :: dst
+
+      INTEGER :: a, b, c, na, nb, nc
+
+      na = SIZE(src, 1); nb = SIZE(src, 2); nc = SIZE(src, 3)
+      CPASSERT(SIZE(dst, 1) == nb .AND. SIZE(dst, 2) == na*nc)
+      DO c = 1, nc
+         DO a = 1, na
+            DO b = 1, nb
+               dst(b, (c - 1)*na + a) = src(a, b, c)
+            END DO
+         END DO
+      END DO
+   END SUBROUTINE pari_transpose_213
+
+! **************************************************************************************************
+!> \brief src(a,b,c) -> dst(a*c, b) with (a,c) merged as a-major in dst columns
+! **************************************************************************************************
+   SUBROUTINE pari_transpose_132(src, dst)
+      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(IN)      :: src
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(OUT)        :: dst
+
+      INTEGER :: a, b, c, na, nb, nc
+
+      na = SIZE(src, 1); nb = SIZE(src, 2); nc = SIZE(src, 3)
+      CPASSERT(SIZE(dst, 1) == na*nc .AND. SIZE(dst, 2) == nb)
+      DO c = 1, nc
+         DO a = 1, na
+            DO b = 1, nb
+               dst((c - 1)*na + a, b) = src(a, b, c)
+            END DO
+         END DO
+      END DO
+   END SUBROUTINE pari_transpose_132
 
 ! **************************************************************************************************
 !> \brief fetch a 3c block; zero block if absent (below the integral filter)

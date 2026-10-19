@@ -474,6 +474,12 @@ CONTAINS
       INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: iapc_pairs
       INTEGER, ALLOCATABLE, DIMENSION(:, :, :)           :: sparsity_pattern
       LOGICAL                                            :: estimate_mem, print_progress, use_delta_p
+      ! TODO(dev dump, remove before PR): PARI A/B per-image KS export
+      TYPE(kpoint_type), POINTER                         :: kpoints_dbg
+      INTEGER, DIMENSION(:, :), POINTER                  :: itc_dbg
+      INTEGER                                            :: udump, ia_dbg, ja_dbg
+      TYPE(dbcsr_iterator_type)                          :: iter_dbg
+      REAL(dp), DIMENSION(:, :), POINTER                 :: blk_dbg
       REAL(dp)                                           :: etmp, fac, occ, pfac, pref, t1, t2, t3, &
                                                             t4
       TYPE(cp_blacs_env_type), POINTER                   :: blacs_env_sub
@@ -827,6 +833,28 @@ CONTAINS
             CALL dbt_filter(ri_data%ks_t(i_spin, i_img), ri_data%filter_eps)
             CALL dbt_copy(ri_data%ks_t(i_spin, i_img), t_2c_ao_tmp(1))
             CALL dbt_copy_tensor_to_matrix(t_2c_ao_tmp(1), ks_desymm)
+            ! TODO(dev dump, remove before PR): sparse per-image KS blocks for
+            ! the PARI A/B (image, atom pair, block); cells via kpoint table
+            IF (i_spin == 1) THEN
+               IF (i_img == 1) THEN
+                  NULLIFY (kpoints_dbg, itc_dbg)
+                  CALL get_qs_env(qs_env=qs_env, kpoints=kpoints_dbg)
+                  CALL get_kpoint_info(kpoints_dbg, index_to_cell=itc_dbg)
+                  OPEN (NEWUNIT=udump, FILE="GLOBAL_K_DUMP", status="replace")
+                  WRITE (udump, *) nimg, natom
+                  DO ia_dbg = 1, nimg
+                     WRITE (udump, *) itc_dbg(:, ia_dbg)
+                  END DO
+               END IF
+               CALL dbcsr_iterator_start(iter_dbg, ks_desymm)
+               DO WHILE (dbcsr_iterator_blocks_left(iter_dbg))
+                  CALL dbcsr_iterator_next_block(iter_dbg, ia_dbg, ja_dbg, blk_dbg)
+                  WRITE (udump, *) i_img, ia_dbg, ja_dbg
+                  WRITE (udump, '(ES25.16)') blk_dbg(:, :)
+               END DO
+               CALL dbcsr_iterator_stop(iter_dbg)
+               IF (i_img == nimg) CLOSE (udump)
+            END IF
             CALL dbt_copy_tensor_to_matrix(t_2c_ao_tmp(1), tmp)
             CALL dbcsr_add(ks_matrix(i_spin, i_img)%matrix, tmp, 1.0_dp, 1.0_dp)
 
@@ -1956,6 +1984,12 @@ CONTAINS
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: found
       REAL(dp)                                           :: fac
+      ! TODO(dev dump, remove before PR)
+      TYPE(kpoint_type), POINTER                         :: kpoints_dbg
+      INTEGER, DIMENSION(:, :), POINTER                  :: itc_dbg
+      INTEGER                                            :: udump, ia_dbg, ja_dbg
+      TYPE(dbcsr_iterator_type)                          :: iter_dbg
+      REAL(dp), DIMENSION(:, :), POINTER                 :: blk_dbg
       REAL(dp), DIMENSION(:, :), POINTER                 :: pblock, pblock_desymm
       TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks, rho_desymm
       TYPE(dbt_type)                                     :: tmp
@@ -2029,6 +2063,28 @@ CONTAINS
          END DO
       END DO
       CALL neighbor_list_iterator_release(nl_iterator)
+
+      ! TODO(dev dump, remove before PR): sparse dump of the desymmetrized rho
+      ! images (the PARI pdiff ground truth); cells via kpoint table
+      IF (nspins == 1) THEN
+         CALL get_qs_env(qs_env=qs_env, kpoints=kpoints_dbg)
+         CALL get_kpoint_info(kpoints_dbg, index_to_cell=itc_dbg)
+         OPEN (NEWUNIT=udump, FILE="GLOBAL_P_DUMP", status="replace")
+         WRITE (udump, *) nimg
+         DO ia_dbg = 1, nimg
+            WRITE (udump, *) itc_dbg(:, ia_dbg)
+         END DO
+         DO i_img = 1, nimg
+            CALL dbcsr_iterator_start(iter_dbg, rho_desymm(1, i_img)%matrix)
+            DO WHILE (dbcsr_iterator_blocks_left(iter_dbg))
+               CALL dbcsr_iterator_next_block(iter_dbg, ia_dbg, ja_dbg, blk_dbg)
+               WRITE (udump, *) i_img, ia_dbg, ja_dbg
+               WRITE (udump, '(ES25.16)') blk_dbg(:, :)
+            END DO
+            CALL dbcsr_iterator_stop(iter_dbg)
+         END DO
+         CLOSE (udump)
+      END IF
 
       DO i_img = 1, nimg
          DO i_spin = 1, nspins
