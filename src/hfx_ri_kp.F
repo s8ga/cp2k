@@ -418,6 +418,7 @@ CONTAINS
       CHARACTER(LEN=default_string_length)               :: bar
       INTEGER                                            :: rep
 
+      rep = 0
       IF (ri_data%unit_nr > 0) THEN
          IF (b_img == 1) THEN
             WRITE (ri_data%unit_nr, '(/T6,A)', advance="no") '[-'
@@ -629,7 +630,7 @@ CONTAINS
       CALL section_vals_val_get(print_section, "KP_RI_MEMORY_ESTIMATE", l_val=estimate_mem)
 
       ALLOCATE (iapc_pairs(nimg, 2))
-      IF (estimate_mem .AND. geometry_did_change) THEN
+      IF (estimate_mem .AND. geometry_did_change .AND. nimg_nze > 0) THEN
          !Populate work tensors to simulate maximum usage
          CALL get_iapc_pairs(iapc_pairs, 1, ri_data, qs_env)
          CALL fill_3c_stack(t_3c_work_3(1), t_3c_int, iapc_pairs(:, 1), 3, ri_data, &
@@ -2089,6 +2090,7 @@ CONTAINS
       LOGICAL, INTENT(IN), OPTIONAL                      :: off_diagonal, skip_inverse
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'get_ext_2c_int'
+      CHARACTER(LEN=default_string_length)               :: error_msg
 
       INTEGER :: group, handle, handle2, i_img, i_RI, iatom, iblk, ikind, img_tot, j_img, j_RI, &
          jatom, jblk, jkind, n_dependent, natom, nblks_RI, nimg, nkind
@@ -2344,6 +2346,12 @@ CONTAINS
                CALL dbcsr_copy(work_tight_inv, work_tight)
                CALL cp_dbcsr_power(work_tight_inv, -1.0_dp, ri_data%eps_eigval, n_dependent, &
                                    para_env, blacs_env, verbose=ri_data%unit_nr_dbcsr > 0)
+               IF (n_dependent > 0) THEN
+                  WRITE (error_msg, '(A,I6,A)') &
+                     "DIAG inversion of the 2c metric dropped ", n_dependent, &
+                     " eigenvector pairs below eps_eigval; the metric may be ill-conditioned"
+                  CPWARN(error_msg)
+               END IF
             END SELECT
          ELSE
             CALL dbcsr_copy(work_tight_inv, work_tight)
@@ -3140,7 +3148,7 @@ CONTAINS
                         CALL para_env%isend(msgin=send_buff(n_mess)%array, dest=dest, &
                                             request=send_req(is), tag=tag)
                      END IF
-                     DEALLOCATE (blk)
+                     IF (ALLOCATED (blk)) DEALLOCATE (blk)
                   END IF
 
                   !receiving the message

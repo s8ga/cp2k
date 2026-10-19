@@ -536,7 +536,8 @@ CONTAINS
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="EPS_FILTER_2C", &
-                          description="Filter threshold for 2c integrals. Default should be kept.", &
+                          description="Filter threshold for 2c integrals (gamma-point RI only; not used on the "// &
+                          "k-point path, where the operator range is derived from EPS_SCHWARZ). Default should be kept.", &
                           default_r_val=1.0E-12_dp)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
@@ -609,7 +610,9 @@ CONTAINS
                           "is built by adding the contribution of the denisty difference (wrt to previous step) "// &
                           "to the KS matrix of the previous step. As the SCF converges, the density fluctuations "// &
                           "get smaller and sparsity increases, leading to faster SCF steps. Not always "// &
-                          "numerically stable => turn off if SCF struggles to converge.", &
+                          "numerically stable => turn off if SCF struggles to converge. Benefits grow only "// &
+                          "as the density difference becomes sparse (larger systems, later SCF cycles); "// &
+                          "the resident image tensors are unaffected.", &
                           variants=s2a("USE_DELTA_P", "KP_USE_P_DIFF", "USE_P_DIFF"), &
                           usage="KP_USE_DELTA_P {logical}", &
                           repeats=.FALSE., &
@@ -716,7 +719,8 @@ CONTAINS
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="EPS_PGF_ORB", &
-                          description="Sets precision of the integral tensors.", &
+                          description="Sets precision of the integral tensors: effective (epsilon-truncated) radii of the "// &
+                          "orbital and RI Gaussian basis sets. The same value is applied to both.", &
                           variants=["KP_EPS_PGF_ORB"], &
                           default_r_val=1.0E-5_dp)
       CALL section_add_keyword(section, keyword)
@@ -751,8 +755,8 @@ CONTAINS
 
       CALL keyword_create(keyword, __LOCATION__, name="MEMORY_CUT", &
                           description="Memory reduction factor. This keyword controls the batching of tensor "// &
-                          "contractions into smaller, more manageable chunks. The details vary "// &
-                          "depending on the RI_FLAVOR.", &
+                          "contractions into smaller, more manageable chunks. Also active for k-point RI. "// &
+                          "The details vary depending on the RI_FLAVOR.", &
                           default_i_val=3)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)

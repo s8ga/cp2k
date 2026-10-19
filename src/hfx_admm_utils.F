@@ -1027,6 +1027,16 @@ CONTAINS
       CALL section_vals_get(adiabatic_rescaling_section, explicit=do_adiabatic_rescaling)
       IF (do_adiabatic_rescaling) CPABORT("No adiabatic rescaling implementation with K-points HFX")
 
+      ! only finite-range potentials are meaningful with k-points: a finite image sum of
+      ! the plain Coulomb operator is not the periodic operator (silently wrong physics);
+      ! mirrors the whitelist in admm_init_hamiltonians
+      SELECT CASE (x_data(1, 1)%potential_parameter%potential_type)
+      CASE (do_potential_truncated, do_potential_mix_cl_trunc, do_potential_short)
+         ! supported
+      CASE DEFAULT
+         CPABORT("K-points HFX requires a TRUNCATED, MIX_CL_TRUNC or SHORTRANGE potential")
+      END SELECT
+
       IF (dft_control%do_admm) THEN
          CALL get_admm_env(qs_env%admm_env, matrix_ks_aux_fit_kp=matrix_ks_aux_fit_kp, &
                            matrix_ks_aux_fit_im=matrix_ks_aux_fit_im, &
@@ -1059,6 +1069,7 @@ CONTAINS
       ALLOCATE (hf_energy(n_rep_hf))
 
       eold = 0.0_dp
+      ehfx = 0.0_dp
 
       DO irep = 1, n_rep_hf
 
@@ -1246,6 +1257,7 @@ CONTAINS
       ALLOCATE (hf_energy(n_rep_hf))
 
       eold = 0.0_dp
+      ehfx = 0.0_dp
 
       DO irep = 1, n_rep_hf
          ! Remember: Vhfx is added, energy is calclulated from total Vhfx,
