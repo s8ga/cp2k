@@ -24,52 +24,53 @@ MODULE hfx_ri_kp_pari
 
    USE basis_set_types,                 ONLY: gto_basis_set_p_type
    USE cp_control_types,                ONLY: dft_control_type
-   USE cp_dbcsr_api,                    ONLY: dbcsr_copy, dbcsr_create, dbcsr_distribution_release, &
-                                              dbcsr_distribution_type, dbcsr_get_block_p, &
-                                              dbcsr_iterator_blocks_left, dbcsr_iterator_next_block, &
-                                              dbcsr_iterator_start, dbcsr_iterator_stop, &
-                                              dbcsr_get_stored_coordinates, dbcsr_iterator_type, &
-                                              dbcsr_p_type, dbcsr_put_block, &
-                                              dbcsr_release, dbcsr_replicate_all, dbcsr_type, &
-                                              dbcsr_type_no_symmetry
+   USE cp_dbcsr_api,                    ONLY: &
+        dbcsr_copy, dbcsr_create, dbcsr_distribution_release, dbcsr_distribution_type, &
+        dbcsr_get_block_p, dbcsr_get_stored_coordinates, dbcsr_iterator_blocks_left, &
+        dbcsr_iterator_next_block, dbcsr_iterator_start, dbcsr_iterator_stop, dbcsr_iterator_type, &
+        dbcsr_p_type, dbcsr_put_block, dbcsr_release, dbcsr_replicate_all, dbcsr_type, &
+        dbcsr_type_no_symmetry
    USE cp_dbcsr_operations,             ONLY: cp_dbcsr_dist2d_to_dist
-   USE dbt_api,                          ONLY: dbt_create, dbt_destroy, dbt_distribution_destroy, &
-                                              dbt_distribution_new, dbt_distribution_type, &
-                                              dbt_filter, dbt_get_block, dbt_mp_environ_pgrid, &
-                                              dbt_pgrid_create, dbt_pgrid_destroy, dbt_pgrid_type, &
-                                              dbt_type
+   USE dbt_api,                         ONLY: &
+        dbt_create, dbt_destroy, dbt_distribution_destroy, dbt_distribution_new, &
+        dbt_distribution_type, dbt_filter, dbt_get_block, dbt_mp_environ_pgrid, dbt_pgrid_create, &
+        dbt_pgrid_destroy, dbt_pgrid_type, dbt_type
    USE distribution_2d_types,           ONLY: distribution_2d_type
-   USE hfx_ri_kp,                        ONLY: get_kp_and_ri_images
-   USE hfx_types,                        ONLY: hfx_ri_type
-   USE input_cp2k_hfx,                   ONLY: ri_pmat
-   USE kinds,                            ONLY: dp
-   USE kpoint_types,                     ONLY: get_kpoint_info, kpoint_type
-   USE machine,                          ONLY: m_flush, m_walltime
-   USE mathlib,                          ONLY: get_pseudo_inverse_diag
-   USE message_passing,                  ONLY: mp_cart_type, mp_para_env_type
-!$ USE OMP_LIB,                          ONLY: omp_get_max_threads, omp_get_thread_num
-   USE particle_types,                   ONLY: particle_type
-   USE qs_environment_types,            ONLY: get_qs_env, qs_environment_type
-   USE qs_integral_utils,               ONLY: basis_set_list_setup
-   USE qs_kind_types,                    ONLY: qs_kind_type
-   USE qs_neighbor_list_types,          ONLY: neighbor_list_set_p_type, release_neighbor_list_sets
-   USE qs_tensors,                       ONLY: build_2c_integrals, build_2c_neighbor_lists, &
-                                              build_3c_integrals, build_3c_neighbor_lists, &
-                                              neighbor_list_3c_destroy
-   USE qs_tensors_types,                 ONLY: create_3c_tensor, distribution_3d_create, &
-                                              distribution_3d_type, neighbor_list_3c_type
+   USE hfx_ri_kp,                       ONLY: get_kp_and_ri_images
+   USE hfx_types,                       ONLY: hfx_ri_type
+   USE input_cp2k_hfx,                  ONLY: ri_pmat
+   USE kinds,                           ONLY: dp
+   USE kpoint_types,                    ONLY: get_kpoint_info,&
+                                              kpoint_type
+   USE machine,                         ONLY: m_flush,&
+                                              m_walltime
+   USE message_passing,                 ONLY: mp_cart_type,&
+                                              mp_para_env_type
+
+!$ USE OMP_LIB, ONLY: omp_get_max_threads, omp_get_thread_num
+   USE particle_types, ONLY: particle_type
+   USE qs_environment_types, ONLY: get_qs_env, qs_environment_type
+   USE qs_integral_utils, ONLY: basis_set_list_setup
+   USE qs_kind_types, ONLY: qs_kind_type
+   USE qs_neighbor_list_types, ONLY: neighbor_list_set_p_type, release_neighbor_list_sets
+   USE qs_tensors, ONLY: build_2c_integrals, build_2c_neighbor_lists, &
+                         build_3c_integrals, build_3c_neighbor_lists, &
+                         neighbor_list_3c_destroy
+   USE qs_tensors_types, ONLY: create_3c_tensor, distribution_3d_create, &
+                               distribution_3d_type, neighbor_list_3c_type
 #include "../base/base_uses.f90"
 
    IMPLICIT NONE
 
    PRIVATE
 
-   CHARACTER(LEN=*), PARAMETER, PRIVATE :: moduleN = 'hfx_ri_kp_pari'
+   CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'hfx_ri_kp_pari'
 
-   ! relative eigenvalue threshold of the per-pair truncated pseudo-inverse.
-   ! TODO(dev experiment): the appendix-10 insensitivity calibration predates the
-   ! storage-parity fix and is overturned by the regularization-path A/B; testing
-   ! the solve-side truncation directly
+   ! relative regularization strength of the per-pair LM pseudo-inverse
+   ! (mu = eps_eig * w_max). Provenance: the appendix-10 insensitivity
+   ! calibration (at 1e-10, then in truncated form) predates the
+   ! storage-parity fix and was overturned by the regularization-path A/B;
+   ! 3e-3 is that A/B's choice -- a dedicated sensitivity scan is pending
    REAL(KIND=dp), PRIVATE :: pari_eps_eig = 3.0E-3_dp
    ! TODO(dev experiment, remove before PR): per-term ablation switch (bit 1=T1, 2=T2, 4=T3, 8=T4)
    INTEGER, PRIVATE :: pari_term_mask = 15
@@ -93,40 +94,45 @@ MODULE hfx_ri_kp_pari
    INTEGER, PRIVATE :: pari_ri_mode = 1
    ! TODO(dev diagnostic, remove before PR): per-term F images and far-chain
    ! source accumulators; off by default -- their GEMMs double every scatter
-   LOGICAL, PRIVATE :: pari_diag = .FALSE.
 
    PUBLIC :: hfx_ri_update_ks_kp_pari, pari_pair_pinv
 
 CONTAINS
 
 ! **************************************************************************************************
-!> \brief Truncated pseudo-inverse of a dense symmetric pair-domain RI metric.
-!>        Always the eigendecomposition pseudo-inverse with a relative eigenvalue
-!>        threshold (mathlib get_pseudo_inverse_diag), mirroring the reference
-!>        semantics (symmetric eigendecomposition, keep w > eps_eig*wmax).
-!>        A direct Cholesky inverse is deliberately not attempted: the PARI union
-!>        basis is intentionally redundant (pair-domain condition numbers of order
-!>        1e10 measured for Si), where a direct inverse deviates O(1) from the
-!>        truncated solve in the near-null directions, while the contraction
-!>        coefficients stay stable only under truncation.
+!> \brief Levenberg-Marquardt regularized inverse of a dense symmetric
+!>        pair-domain RI metric: w_inv = w/(w^2 + mu^2) with mu = eps_eig*w_max.
+!>        Genuine modes (w >> mu) stay unbiased, near-null and noise modes damp
+!>        smoothly to zero, and the global amplification is capped at 1/(2 mu);
+!>        the response is differentiable, so the SCF mixer never sees
+!>        eigenvalue-threshold jumps (unlike a hard cutoff). The price: modes
+!>        near w ~ mu are attenuated ~50 percent, the fit is biased at that
+!>        scale, and the exchange-energy error is first order in that bias
+!>        (measured fit residuals 1e-3..1e-1 at the default -- see the probe in
+!>        pari_solve_pairs); recalibrate eps_eig for a new system class.
+!>        A direct Cholesky inverse is deliberately not attempted: the PARI
+!>        union basis is intentionally redundant (pair-domain condition numbers
+!>        of order 1e10 measured for Si), where a direct inverse deviates O(1)
+!>        from the regularized solve in the near-null directions, while the
+!>        contraction coefficients stay stable only under regularization.
 !> \param vmat dense symmetric pair-domain metric (P|Q), untouched on exit
-!> \param eps_eig relative eigenvalue threshold (oracle-calibrated default 1.0E-10)
-!> \param vinv truncated pseudo-inverse, allocated by the caller (shape of vmat)
+!> \param eps_eig relative regularization strength (default 3.0E-3, knob file PARI_EPS_EIG)
+!> \param vinv regularized inverse, allocated by the caller (shape of vmat)
 !> \param rcond reciprocal condition estimate 1/(||V||_1 ||V^+||_1), for logging
 ! **************************************************************************************************
    SUBROUTINE pari_pair_pinv(vmat, eps_eig, vinv, rcond)
 
-      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)      :: vmat
-      REAL(KIND=dp), INTENT(IN)                       :: eps_eig
-      REAL(KIND=dp), DIMENSION(:, :), INTENT(OUT)     :: vinv
-      REAL(KIND=dp), INTENT(OUT)                      :: rcond
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN)         :: vmat
+      REAL(KIND=dp), INTENT(IN)                          :: eps_eig
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(OUT)        :: vinv
+      REAL(KIND=dp), INTENT(OUT)                         :: rcond
 
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'pari_pair_pinv'
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'pari_pair_pinv'
 
       INTEGER                                            :: handle, i, info, lwork, n
-      REAL(KIND=dp)                                      :: ainv_norm, a_norm, mu, w_inv
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)          :: w, work
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)       :: u_scaled, vwork
+      REAL(KIND=dp)                                      :: a_norm, ainv_norm, mu, w_inv
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: w, work
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: u_scaled, vwork
       REAL(KIND=dp), EXTERNAL                            :: dlange
 
       CALL timeset(routineN, handle)
@@ -218,7 +224,7 @@ CONTAINS
          fac = 1.0_dp*hf_fraction
       END IF
 
-      CALL pari_assemble_ks(ri_data, qs_env, rho_ao, ks_matrix, ehfx, fac, hf_fraction)
+      CALL pari_assemble_ks(ri_data, qs_env, rho_ao, ks_matrix, ehfx, fac)
 
       CALL timestop(handle)
 
@@ -252,29 +258,29 @@ CONTAINS
 !> \param ks_matrix KS matrix images (accumulated with -fac, legacy convention)
 !> \param ehfx exchange energy 0.5 sum_b Tr((-fac F^b) P^b)
 !> \param fac spin-reduced exchange prefactor
-!> \param hf_fraction ...
 ! **************************************************************************************************
-   SUBROUTINE pari_assemble_ks(ri_data, qs_env, rho_ao, ks_matrix, ehfx, fac, hf_fraction)
-      TYPE(hfx_ri_type), INTENT(INOUT)                  :: ri_data
-      TYPE(qs_environment_type), POINTER                :: qs_env
-      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER      :: rho_ao, ks_matrix
-      REAL(KIND=dp), INTENT(OUT)                        :: ehfx
-      REAL(KIND=dp), INTENT(IN)                         :: fac, hf_fraction
+   SUBROUTINE pari_assemble_ks(ri_data, qs_env, rho_ao, ks_matrix, ehfx, fac)
+      TYPE(hfx_ri_type), INTENT(INOUT)                   :: ri_data
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: rho_ao, ks_matrix
+      REAL(KIND=dp), INTENT(OUT)                         :: ehfx
+      REAL(KIND=dp), INTENT(IN)                          :: fac
 
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'pari_assemble_ks'
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'pari_assemble_ks'
 
       CHARACTER(LEN=64)                                  :: progbuf
       INTEGER                                            :: ienv
-      LOGICAL                                            :: qexist
-      REAL(KIND=dp)                                     :: t_stage
+      LOGICAL                                            :: pari_diag, qexist
+      REAL(KIND=dp)                                      :: t_stage
+
       EXTERNAL :: dgemm
-      INTEGER :: Aat, Bat, b_img, handle, htot, i, ie, ip, ithr, iu, iy, iz, j, jb, k, l, lam, &
+      INTEGER :: Aat, Bat, b_img, handle, htot, i, ie, imu, inu, ip, ithr, iu, iy, iz, j, jb, k, l, lam, &
                  lc, mu, nAOi, nAOj, nAOk, nAOl, gstep, nimg, naomax, nlive, npd, nRIi, &
                  ki_tot, nRIj, nRIk, nRIl, nrimax, nao, natom, npct, nthr, nu, nyl, o0, src, &
                  offI, offJ, offK, offL, lpct, unit_dump, u_img, v_img, w_img, x_img, &
                  y_img, z_img, z1, z2
       INTEGER, ALLOCATABLE, DIMENSION(:)                :: glen, slg, live_ip, live_y, mimg, pd_list, &
-                                                            pd_rev, y_list
+                                                           pd_rev, y_list
       INTEGER, ALLOCATABLE, DIMENSION(:, :)             :: hoff, imgcell, live_fill, live_off, reldiff
       INTEGER, ALLOCATABLE, DIMENSION(:, :, :)          :: pair3, pair3s
       INTEGER, ALLOCATABLE, DIMENSION(:, :)             :: live_cnt
@@ -284,9 +290,10 @@ CONTAINS
       INTEGER, DIMENSION(:, :), POINTER                 :: index_to_cell
       INTEGER, DIMENSION(:, :, :), POINTER              :: cell_to_index
       TYPE(mp_para_env_type), POINTER                   :: para_env
-      REAL(KIND=dp)                                     :: d1y, d1z, d4e, d4v, d4w, half, trb, worst_sym
+      REAL(KIND=dp)                                     :: d1y, d1z, d4e, d4v, d4w, fd_delta, fd_x, half, trb, worst_sym
       LOGICAL                                            :: lpair
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)          :: c3norm, c3norms, Gflat, Gj, Hflat, pdiff_norm
+      REAL(KIND=dp)                                     :: cn_thr
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)       :: ptmp, vblk
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)    :: bd2_blk, fimg, pdiff
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :) :: fimg_t
@@ -300,7 +307,7 @@ CONTAINS
       ! the T4 fill is ONE dgemm per (k, x, z, mu) against the whole P row block
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :) :: bd2buf
       ! b7c stacks (T4 iz / T2 y): per-group live lists, packed A, stacked W
-      INTEGER :: iw, nwl, nzl, izl, rr, nyl_l
+      INTEGER :: iw, lwi, nwl, nzl, izl, rr, nyl_l
       INTEGER, ALLOCATABLE, DIMENSION(:) :: w_iz, w_im, w_off, izl_of, yl_y, yl_off
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :) :: Ap, Wt, Ap2, Wt2
       REAL(KIND=dp), DIMENSION(:, :), POINTER           :: blk
@@ -309,6 +316,9 @@ CONTAINS
 
       NULLIFY (kpoints, cell_to_index, index_to_cell, blk, para_env)
       CALL timeset(routineN, handle)
+
+      CALL get_qs_env(qs_env, kpoints=kpoints, para_env=para_env)
+      CALL get_kpoint_info(kpoints, cell_to_index=cell_to_index, index_to_cell=index_to_cell)
 
       ! TODO(dev experiment, remove before PR): per-term ablation switch,
       ! selected by a PARI_TERM_MASK file in the run directory (bit 1=T1, 2=T2, 4=T3, 8=T4)
@@ -335,17 +345,15 @@ CONTAINS
       ! TODO(dev diagnostic, remove before PR): opt-in diagnostics
       ! (single-rank only: the per-term accumulators live inside the
       ! rank-split atom loop and would be partial otherwise)
+      ! per-call evaluation (a module variable would stay sticky across qs_envs)
       INQUIRE (FILE="PARI_KEEP_DIAG", EXIST=qexist)
-      IF (qexist .AND. para_env%num_pe == 1) pari_diag = .TRUE.
+      pari_diag = qexist .AND. para_env%num_pe == 1
 
       CPASSERT(SIZE(rho_ao, 1) == 1) ! spin-generalisation is a follow-up
 
       natom = SIZE(ri_data%bsizes_AO)
       nao = SUM(ri_data%bsizes_AO)
       nimg = ri_data%pari_nimg
-
-      CALL get_qs_env(qs_env, kpoints=kpoints, para_env=para_env)
-      CALL get_kpoint_info(kpoints, cell_to_index=cell_to_index, index_to_cell=index_to_cell)
 
       ! image cells, opposite-image and relative-image tables
       ALLOCATE (mimg(nimg), reldiff(nimg, nimg))
@@ -429,6 +437,38 @@ CONTAINS
       DO b_img = 1, nimg
          IF (mimg(b_img) == 0) pdiff(:, :, b_img) = 0.0_dp
       END DO
+      ! TODO(dev experiment, remove before PR): finite-difference gate -- perturb
+      ! pdiff by fd_delta * X with a deterministic symmetric pattern (X^b and its
+      ! mirror transpose-paired, self-mirror images symmetrized; mirrorless stay
+      ! void, matching the S1 convention). E(P+/-dX) from two runs vs
+      ! tr(F_sym.X) tests whether the assembled operator is dE/dP
+      INQUIRE (FILE="PARI_FD_DELTA", EXIST=qexist)
+      IF (qexist) THEN
+         OPEN (NEWUNIT=ienv, FILE="PARI_FD_DELTA", status="old", action="read")
+         READ (ienv, *) fd_delta
+         CLOSE (ienv)
+         DO b_img = 1, nimg
+            IF (mimg(b_img) > b_img) THEN
+               DO imu = 1, nao
+                  DO inu = 1, nao
+                     fd_x = 0.5_dp*(SIN(0.1_dp*imu + 0.37_dp*inu + 0.71_dp*b_img) &
+                                    + SIN(0.1_dp*inu + 0.37_dp*imu + 0.71_dp*mimg(b_img)))
+                     pdiff(imu, inu, b_img) = pdiff(imu, inu, b_img) + fd_delta*fd_x
+                     pdiff(inu, imu, mimg(b_img)) = pdiff(inu, imu, mimg(b_img)) + fd_delta*fd_x
+                  END DO
+               END DO
+            ELSE IF (mimg(b_img) == b_img) THEN
+               DO imu = 1, nao
+                  DO inu = 1, imu
+                     fd_x = 0.5_dp*(SIN(0.1_dp*imu + 0.37_dp*inu + 0.71_dp*b_img) &
+                                    + SIN(0.1_dp*inu + 0.37_dp*imu + 0.71_dp*b_img))
+                     pdiff(imu, inu, b_img) = pdiff(imu, inu, b_img) + fd_delta*fd_x
+                     IF (inu /= imu) pdiff(inu, imu, b_img) = pdiff(inu, imu, b_img) + fd_delta*fd_x
+                  END DO
+               END DO
+            END IF
+         END DO
+      END IF
       DO b_img = 1, nimg
          CALL dbcsr_release(rho_rep(b_img)%matrix)
       END DO
@@ -449,7 +489,7 @@ CONTAINS
       live_off = 1
       DO ip = 1, ri_data%pari_npair
          c3norm(ip) = SQRT(SUM(ri_data%pari_c3(ri_data%pari_c3_offset(ip): &
-                                              ri_data%pari_c3_offset(ip + 1) - 1)**2))
+                                               ri_data%pari_c3_offset(ip + 1) - 1)**2))
          IF (ri_data%pari_pair_img(ip) >= 1 .AND. ri_data%pari_pair_img(ip) <= nimg) THEN
             pair3(ri_data%pari_pair_i(ip), ri_data%pari_pair_j(ip), ri_data%pari_pair_img(ip)) = ip
          END IF
@@ -475,10 +515,15 @@ CONTAINS
             END IF
          END IF
       END DO
+      ! live-pair gate relative to the pool's largest C3 norm: scale-free
+      ! across basis sizes (the measured pool is bimodal -- exactly dead vs
+      ! live, no gray band -- so this selects the same set as any threshold
+      ! many orders below the smallest live norm)
+      cn_thr = 1.0E-12_dp*MAXVAL(c3norms)
       DO ip = 1, ri_data%pari_npair
          IF (ri_data%pari_pair_img(ip) >= 1 .AND. ri_data%pari_pair_img(ip) <= nimg) THEN
             IF (pair3s(ri_data%pari_pair_i(ip), ri_data%pari_pair_j(ip), ri_data%pari_pair_img(ip)) /= 0 .AND. &
-                c3norms(ip) > 1.0E-12_dp) live_cnt(ri_data%pari_pair_i(ip), ri_data%pari_pair_j(ip)) = &
+                c3norms(ip) > cn_thr) live_cnt(ri_data%pari_pair_i(ip), ri_data%pari_pair_j(ip)) = &
                live_cnt(ri_data%pari_pair_i(ip), ri_data%pari_pair_j(ip)) + 1
          END IF
       END DO
@@ -501,8 +546,8 @@ CONTAINS
       DO ip = 1, ri_data%pari_npair
          IF (ri_data%pari_pair_img(ip) >= 1 .AND. ri_data%pari_pair_img(ip) <= nimg) THEN
             Aat = ri_data%pari_pair_i(ip); Bat = ri_data%pari_pair_j(ip)
-            IF (c3norms(ip) > 1.0E-12_dp .AND. &
-                 pair3s(Aat, Bat, ri_data%pari_pair_img(ip)) /= 0) THEN
+            IF (c3norms(ip) > cn_thr .AND. &
+                pair3s(Aat, Bat, ri_data%pari_pair_img(ip)) /= 0) THEN
                live_y(live_fill(Aat, Bat)) = ri_data%pari_pair_img(ip)
                live_ip(live_fill(Aat, Bat)) = ip
                live_fill(Aat, Bat) = live_fill(Aat, Bat) + 1
@@ -614,7 +659,8 @@ CONTAINS
          gstep = SUM(glen)
          ALLOCATE (Gflat(nyl*gstep))
 !$OMP PARALLEL DEFAULT(NONE) &
-!$OMP SHARED(pari_term_mask, i, ri_data, natom, nimg, nao, nyl, y_list, bd_all, fimg, reldiff, pair3s, c3norms, nRIi, nAOi, &
+!$OMP SHARED(pari_term_mask, i, ri_data, natom, nimg, nao, nyl, y_list, bd_all, fimg, reldiff, pair3s, c3norms, &
+!$OMP        cn_thr, nRIi, nAOi, &
 !$OMP        offI, glen, gstep, Gflat, nrimax, fimg_t, f1src_y, f1src_z, imgcell, pari_hard_gate, &
 !$OMP        pari_diag) &
 !$OMP PRIVATE(l, nRIl, nAOl, offL, iy, y_img, lam, lc, jb, j, nAOj, offJ, b_img, z1, vblk, ithr, nthr)
@@ -622,7 +668,7 @@ CONTAINS
          nthr = 1
 !$       ithr = omp_get_thread_num()
 !$       nthr = omp_get_max_threads()
-         IF (ALLOCATED (vblk)) DEALLOCATE (vblk)
+         IF (ALLOCATED(vblk)) DEALLOCATE (vblk)
          ALLOCATE (vblk(nrimax, nrimax))
          DO lc = 1, natom*nyl
             IF (MOD(lc - 1, nthr) /= ithr) CYCLE
@@ -652,7 +698,7 @@ CONTAINS
                   z1 = reldiff(b_img, y_img)
                   IF (z1 <= 0) CYCLE
                   IF (pair3s(l, j, z1) == 0) CYCLE
-                  IF (c3norms(pair3s(l, j, z1)) <= 1.0E-12_dp) CYCLE
+                  IF (c3norms(pair3s(l, j, z1)) <= cn_thr) CYCLE
                   CALL dgemm('N', 'N', nAOi, nAOj, nRIl*nAOl, 1.0_dp, &
                              Gflat((iy - 1)*gstep + SUM(glen(1:l - 1)) + 1), nAOi, &
                              ri_data%pari_c3(ri_data%pari_c3_offset(pair3s(l, j, z1))), nRIl*nAOl, &
@@ -720,8 +766,8 @@ CONTAINS
          lpct = 0
 !$       ithr = omp_get_thread_num()
 !$       nthr = omp_get_max_threads()
-         IF (ALLOCATED (bd2_blk)) DEALLOCATE (bd2_blk)
-         IF (ALLOCATED (vblk)) DEALLOCATE (vblk)
+         IF (ALLOCATED(bd2_blk)) DEALLOCATE (bd2_blk)
+         IF (ALLOCATED(vblk)) DEALLOCATE (vblk)
          ALLOCATE (bd2_blk(nrimax, naomax, naomax))
          ALLOCATE (vblk(nrimax, nrimax))
          DO k = 1, natom
@@ -777,7 +823,7 @@ CONTAINS
          CALL pari_stage_banner(ri_data, TRIM(progbuf))
          t_stage = m_walltime()
 !$OMP PARALLEL DEFAULT(NONE) &
-!$OMP SHARED(pari_term_mask, i, ri_data, natom, nimg, nao, fimg, reldiff, pair3s, c3norms, Hflat, hoff, slg, liveH, &
+!$OMP SHARED(pari_term_mask, i, ri_data, natom, nimg, nao, fimg, reldiff, pair3s, c3norms, cn_thr, Hflat, hoff, slg, liveH, &
 !$OMP        nAOi, offI, fimg_t, pari_diag) &
 !$OMP PRIVATE(jb, j, nAOj, offJ, b_img, k, l, nRIl, nAOl, iu, z1, ithr, nthr)
          ithr = 0
@@ -798,7 +844,7 @@ CONTAINS
                      z1 = reldiff(b_img, iu)
                      IF (z1 <= 0) CYCLE
                      IF (pair3s(l, j, z1) == 0) CYCLE
-                     IF (c3norms(pair3s(l, j, z1)) <= 1.0E-12_dp) CYCLE
+                     IF (c3norms(pair3s(l, j, z1)) <= cn_thr) CYCLE
                      CALL dgemm('N', 'N', nAOi, nAOj, nRIl*nAOl, 1.0_dp, &
                                 Hflat(hoff(k, l) + (iu - 1)*slg(l) + 1), nAOi, &
                                 ri_data%pari_c3(ri_data%pari_c3_offset(pair3s(l, j, z1))), nRIl*nAOl, &
@@ -829,7 +875,8 @@ CONTAINS
          t_stage = m_walltime()
 !$OMP PARALLEL DEFAULT(NONE) &
 !$OMP SHARED(pari_term_mask, i, ri_data, natom, nimg, nao, npd, nrimax, naomax, cell_to_index, imgcell, live_off, live_cnt, &
-!$OMP        pari_vgate, pari_hard_gate, live_y, live_ip, pd_list, pd_rev, pdiff, reldiff, mimg, ylive, pair3s, c3norms, bd2buf, &
+!$OMP        pari_vgate, pari_hard_gate, live_y, live_ip, pd_list, pd_rev, pdiff, reldiff, mimg, ylive, pair3s, &
+!$OMP        c3norms, cn_thr, bd2buf, &
 !$OMP        fimg, nAOi, offI, ki_tot, fimg_t, f4src_e, f4src_v, f4src_w, pari_diag) &
 !$OMP PRIVATE(k, nRIk, nAOk, offK, ie, x_img, iz, z_img, l, nAOl, offL, mu, jb, j, nRIj, nAOj, offJ, &
 !$OMP        b_img, v_img, w_img, y_img, lam, Gj, vblk, ithr, nthr, npct, lpct, progbuf, iw, nwl, nzl, &
@@ -839,8 +886,8 @@ CONTAINS
          lpct = 0
 !$       ithr = omp_get_thread_num()
 !$       nthr = omp_get_max_threads()
-         IF (ALLOCATED (Gj)) DEALLOCATE (Gj)
-         IF (ALLOCATED (vblk)) DEALLOCATE (vblk)
+         IF (ALLOCATED(Gj)) DEALLOCATE (Gj)
+         IF (ALLOCATED(vblk)) DEALLOCATE (vblk)
          ALLOCATE (Gj(naomax*nrimax*naomax))
          ALLOCATE (vblk(nrimax, nrimax))
          ALLOCATE (w_iz(nimg), w_im(nimg), w_off(nimg), izl_of(MAX(1, npd)))
@@ -888,9 +935,12 @@ CONTAINS
                      DO iz = 1, npd
                         izl_of(iz) = 0
                      END DO
-                     DO w_img = 1, nimg
-                        IF (pair3s(j, l, w_img) == 0) CYCLE
-                        IF (c3norms(pair3s(j, l, w_img)) <= 1.0E-12_dp) CYCLE
+                     ! hoist (oracle-certified, slice2b/b12_hoist.py): the two
+                     ! pool gates below are exactly the live-table predicate
+                     ! (same pool order, ascending w), so walk the (j,l) live-w
+                     ! list instead of scanning all nimg per combo
+                     DO lwi = live_off(j, l), live_off(j, l) + live_cnt(j, l) - 1
+                        w_img = live_y(lwi)
                         ! y = w + b must be a valid image AND a y_list image
                         y_img = pari_imgsum(cell_to_index, imgcell, nimg, imgcell(:, w_img), imgcell(:, b_img))
                         IF (y_img == 0) CYCLE
@@ -986,15 +1036,15 @@ CONTAINS
          t_stage = m_walltime()
 !$OMP PARALLEL DEFAULT(NONE) &
 !$OMP SHARED(pari_term_mask, i, ri_data, natom, nimg, nao, nrimax, naomax, nyl, y_list, bd_all, fimg, reldiff, pair3s, &
-!$OMP        c3norms, nRIi, nAOi, offI, fimg_t, pari_diag) &
+!$OMP        c3norms, cn_thr, nRIi, nAOi, offI, fimg_t, pari_diag) &
 !$OMP PRIVATE(jb, j, nAOj, nRIj, offJ, b_img, l, nAOl, offL, iy, y_img, z2, lam, vblk, Gj, ithr, nthr, &
 !$OMP        nyl_l, yl_y, yl_off, Ap2, Wt2, mu, rr)
          ithr = 0
          nthr = 1
 !$       ithr = omp_get_thread_num()
 !$       nthr = omp_get_max_threads()
-         IF (ALLOCATED (vblk)) DEALLOCATE (vblk)
-         IF (ALLOCATED (Gj)) DEALLOCATE (Gj)
+         IF (ALLOCATED(vblk)) DEALLOCATE (vblk)
+         IF (ALLOCATED(Gj)) DEALLOCATE (Gj)
          ALLOCATE (vblk(nrimax, nrimax))
          ALLOCATE (Gj(naomax*nrimax*naomax))
          ALLOCATE (yl_y(nyl), yl_off(nyl))
@@ -1017,7 +1067,7 @@ CONTAINS
                   z2 = reldiff(y_img, b_img)
                   IF (z2 <= 0) CYCLE
                   IF (pair3s(j, l, z2) == 0) CYCLE
-                  IF (c3norms(pair3s(j, l, z2)) <= 1.0E-12_dp) CYCLE
+                  IF (c3norms(pair3s(j, l, z2)) <= cn_thr) CYCLE
                   nyl_l = nyl_l + 1
                   yl_y(nyl_l) = y_img
                   yl_off(nyl_l) = ri_data%pari_c3_offset(pair3s(j, l, z2))
@@ -1069,6 +1119,23 @@ CONTAINS
       ! energy, KS puts, dumps) then runs on identical complete data
       CALL para_env%sum(fimg)
 
+      ! structural identity F^b == (F^{-b})^T, measured on the RAW assembly
+      ! BEFORE the symmetric projection below (which would mask any violation);
+      ! this is the primary probe of the image algebra, printed every SCF step
+      worst_sym = 0.0_dp
+      DO b_img = 1, nimg
+         IF (mimg(b_img) > 0) THEN
+            worst_sym = MAX(worst_sym, &
+                            SQRT(SUM((fimg(:, :, b_img) - TRANSPOSE(fimg(:, :, mimg(b_img))))**2))/ &
+                            MAX(SQRT(SUM(fimg(:, :, b_img)**2)), 1.0E-30_dp))
+         END IF
+      END DO
+      WRITE (*, '(A,ES10.3)') " PARI| image symmetry F^b=(F^-b)^T, worst rel deviation: ", worst_sym
+      IF (worst_sym > 1.0E-10_dp) THEN
+         CALL cp_warn(__LOCATION__, "PARI KS assembly: image symmetry F^b = (F^-b)^T violated "// &
+                      "beyond 1e-10 (check the image algebra)")
+      END IF
+
       ! symmetrize the image pairs: the exact exchange satisfies F^b = (F^-b)^T,
       ! so any deviation is error (from one-sided screening or from noise of the
       ! per-pair truncated solves amplified by pair-domain near-null spaces);
@@ -1089,54 +1156,40 @@ CONTAINS
          END IF
       END DO
 
-      ! structural identity F^b == (F^{-b})^T
-      worst_sym = 0.0_dp
-      DO b_img = 1, nimg
-         IF (mimg(b_img) > 0) THEN
-            worst_sym = MAX(worst_sym, &
-                            SQRT(SUM((fimg(:, :, b_img) - TRANSPOSE(fimg(:, :, mimg(b_img))))**2))/ &
-                            MAX(SQRT(SUM(fimg(:, :, b_img)**2)), 1.0E-30_dp))
-         END IF
-      END DO
-      IF (worst_sym > 1.0E-10_dp) THEN
-         CALL cp_warn(__LOCATION__, "PARI KS assembly: image symmetry F^b = (F^-b)^T violated "// &
-                      "beyond 1e-10 (check the image algebra)")
-      END IF
-
       !TODO(dev dump, remove before PR): per-image F, per-term F + symmetry, full P, V blocks
       IF (para_env%mepos == para_env%num_pe - 1) THEN
-      OPEN (NEWUNIT=unit_dump, FILE="PARI_K_DUMP")
-      WRITE (unit_dump, *) nimg, nao, worst_sym
-      WRITE (unit_dump, *) imgcell
-      DO b_img = 1, nimg
-         WRITE (unit_dump, *) b_img
-         WRITE (unit_dump, '(ES25.16)') pdiff(:, :, b_img)
-      END DO
-      DO b_img = 1, nimg
-         WRITE (unit_dump, *) b_img
-         WRITE (unit_dump, '(ES25.16)') fimg(:, :, b_img)
-      END DO
-      ! TODO(dev diagnostic, remove before PR): per-term sections only with
-      ! PARI_KEEP_DIAG (the pdiff/fimg sections above stay -- regression channel)
-      IF (pari_diag) THEN
-         DO ip = 1, 4
-            worst_sym = 0.0_dp
-            DO b_img = 1, nimg
-               IF (mimg(b_img) > 0) THEN
-                  worst_sym = MAX(worst_sym, &
-                                  SQRT(SUM((fimg_t(:, :, b_img, ip) - TRANSPOSE(fimg_t(:, :, mimg(b_img), ip)))**2))/ &
-                                  MAX(SQRT(SUM(fimg_t(:, :, b_img, ip)**2)), 1.0E-30_dp))
-               END IF
-            END DO
-            WRITE (unit_dump, *) ip
-            WRITE (unit_dump, '(ES25.16)') worst_sym
-            DO b_img = 1, nimg
-               WRITE (unit_dump, *) b_img
-               WRITE (unit_dump, '(ES25.16)') fimg_t(:, :, b_img, ip)
-            END DO
+         OPEN (NEWUNIT=unit_dump, FILE="PARI_K_DUMP")
+         WRITE (unit_dump, *) nimg, nao, worst_sym
+         WRITE (unit_dump, *) imgcell
+         DO b_img = 1, nimg
+            WRITE (unit_dump, *) b_img
+            WRITE (unit_dump, '(ES25.16)') pdiff(:, :, b_img)
          END DO
-      END IF
-      CLOSE (unit_dump)
+         DO b_img = 1, nimg
+            WRITE (unit_dump, *) b_img
+            WRITE (unit_dump, '(ES25.16)') fimg(:, :, b_img)
+         END DO
+         ! TODO(dev diagnostic, remove before PR): per-term sections only with
+         ! PARI_KEEP_DIAG (the pdiff/fimg sections above stay -- regression channel)
+         IF (pari_diag) THEN
+            DO ip = 1, 4
+               worst_sym = 0.0_dp
+               DO b_img = 1, nimg
+                  IF (mimg(b_img) > 0) THEN
+                     worst_sym = MAX(worst_sym, &
+                                     SQRT(SUM((fimg_t(:, :, b_img, ip) - TRANSPOSE(fimg_t(:, :, mimg(b_img), ip)))**2))/ &
+                                     MAX(SQRT(SUM(fimg_t(:, :, b_img, ip)**2)), 1.0E-30_dp))
+                  END IF
+               END DO
+               WRITE (unit_dump, *) ip
+               WRITE (unit_dump, '(ES25.16)') worst_sym
+               DO b_img = 1, nimg
+                  WRITE (unit_dump, *) b_img
+                  WRITE (unit_dump, '(ES25.16)') fimg_t(:, :, b_img, ip)
+               END DO
+            END DO
+         END IF
+         CLOSE (unit_dump)
       END IF
 
       ! energy, legacy convention: 0.5 sum_b Tr((-fac F^b) P^b)
@@ -1162,8 +1215,10 @@ CONTAINS
                IF (src == 0) CYCLE
                CALL dbcsr_get_stored_coordinates(ks_matrix(1, b_img)%matrix, Aat, Bat, owner)
                IF (owner == para_env%mepos) THEN
+                  ! summation=.TRUE. so the contract does not depend on the
+                  ! caller zeroing ks_matrix first (it does today)
                   CALL dbcsr_put_block(ks_matrix(1, b_img)%matrix, Aat, Bat, &
-                                       -fac*fimg(offI + 1:offI + nAOi, offJ + 1:offJ + nAOj, src))
+                                       -fac*fimg(offI + 1:offI + nAOi, offJ + 1:offJ + nAOj, src), summation=.TRUE.)
                END IF
             END DO
          END DO
@@ -1195,10 +1250,11 @@ CONTAINS
 
    END SUBROUTINE pari_assemble_ks
 
-
 ! **************************************************************************************************
 !> \brief stage banner for the PARI k-point twin: goes to unit_nr when active,
 !>        otherwise to stdout only when the KP_RI_PROGRESS_BAR print flag is on
+!> \param ri_data ...
+!> \param msg ...
 ! **************************************************************************************************
    SUBROUTINE pari_stage_banner(ri_data, msg)
       TYPE(hfx_ri_type), INTENT(IN)                      :: ri_data
@@ -1215,15 +1271,21 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief index of the image at cell ca+cb, 0 when outside the k-point cell
 !>        list or beyond the HFX image range
+!> \param cell_to_index ...
+!> \param imgcell ...
+!> \param nimg ...
+!> \param ca ...
+!> \param cb ...
+!> \return ...
 ! **************************************************************************************************
    FUNCTION pari_imgsum(cell_to_index, imgcell, nimg, ca, cb) RESULT(img)
-      INTEGER, DIMENSION(:, :, :), POINTER              :: cell_to_index
-      INTEGER, DIMENSION(:, :), INTENT(IN)              :: imgcell
-      INTEGER, INTENT(IN)                               :: nimg
-      INTEGER, DIMENSION(3), INTENT(IN)                 :: ca, cb
-      INTEGER                                           :: img
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+      INTEGER, DIMENSION(:, :), INTENT(IN)               :: imgcell
+      INTEGER, INTENT(IN)                                :: nimg
+      INTEGER, DIMENSION(3), INTENT(IN)                  :: ca, cb
+      INTEGER                                            :: img
 
-      INTEGER, DIMENSION(3)                             :: cc
+      INTEGER, DIMENSION(3)                              :: cc
 
       cc = ca + cb
       IF (cc(1) >= LBOUND(cell_to_index, 1) .AND. cc(1) <= UBOUND(cell_to_index, 1) .AND. &
@@ -1239,14 +1301,20 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief copy the (rowat, colat) block of a per-image 2c matrix into vblk,
 !>        zeroing it when the block is absent (screened image pair)
+!> \param vblk ...
+!> \param mat2c ...
+!> \param rowat ...
+!> \param colat ...
+!> \param nr ...
+!> \param nc ...
 ! **************************************************************************************************
    SUBROUTINE pari_vblock(vblk, mat2c, rowat, colat, nr, nc)
-      REAL(KIND=dp), DIMENSION(:, :), INTENT(OUT)       :: vblk
-      TYPE(dbcsr_type), INTENT(INOUT)                   :: mat2c
-      INTEGER, INTENT(IN)                               :: rowat, colat, nr, nc
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(OUT)        :: vblk
+      TYPE(dbcsr_type), INTENT(INOUT)                    :: mat2c
+      INTEGER, INTENT(IN)                                :: rowat, colat, nr, nc
 
-      LOGICAL                                           :: found
-      REAL(KIND=dp), DIMENSION(:, :), POINTER           :: blk
+      LOGICAL                                            :: found
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: blk
 
       NULLIFY (blk)
       CALL dbcsr_get_block_p(matrix=mat2c, row=rowat, col=colat, block=blk, found=found)
@@ -1276,40 +1344,43 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'hfx_ri_pre_scf_kp_pari'
 
-      INTEGER :: handle, i_RI, i_img, iatom, ienv, jatom, natom, ncell_RI_pari, nkind, nimg, npair
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: bsizes_RI_ext, edist_1, edist_2, &
-                                                            edist_3, img_to_RI_cell_pari, pair_i, &
-                                                            pair_img, pair_j
-      LOGICAL :: qexist
+      INTEGER                                            :: handle, i_img, i_RI, iatom, ienv, jatom, &
+                                                            natom, ncell_RI_pari, nimg, nkind, &
+                                                            npair, unit_dump
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: bsizes_RI_ext, dist_1, dist_2, dist_3, &
+                                                            edist_1, edist_2, edist_3, &
+                                                            img_to_RI_cell_pari, pair_i, pair_img, &
+                                                            pair_j
+      INTEGER, DIMENSION(3)                              :: pcoord, pdims
       INTEGER, DIMENSION(:), POINTER                     :: col_bsize, row_bsize
-      INTEGER, DIMENSION(3)                              :: pdims, pcoord
+      LOGICAL                                            :: qexist, qexist_ri
+      REAL(KIND=dp)                                      :: ri_range_prv
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: vblk
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: blk_2c
-      TYPE(dbcsr_iterator_type)                          :: iter_2c
       TYPE(dbcsr_distribution_type)                      :: dbcsr_dist
+      TYPE(dbcsr_iterator_type)                          :: iter_2c
       TYPE(dbcsr_type), ALLOCATABLE, DIMENSION(:)        :: t_2c_pari
+      TYPE(dbt_distribution_type)                        :: t_dist
+      TYPE(dbt_pgrid_type)                               :: pgrid
       TYPE(dbt_type)                                     :: t_3c_dummy, t_3c_dummy_ext
       TYPE(dbt_type), ALLOCATABLE, DIMENSION(:, :)       :: t_3c_pari
       TYPE(dft_control_type), POINTER                    :: dft_control
       TYPE(distribution_2d_type), POINTER                :: dist_2d
       TYPE(distribution_3d_type)                         :: dist_3d
-      TYPE(gto_basis_set_p_type), ALLOCATABLE, DIMENSION(:) :: basis_set_AO, basis_set_RI
+      TYPE(gto_basis_set_p_type), ALLOCATABLE, &
+         DIMENSION(:)                                    :: basis_set_AO, basis_set_RI
       TYPE(mp_cart_type)                                 :: mp_comm_t3c
-      TYPE(mp_para_env_type), POINTER                    :: para_env
-      TYPE(neighbor_list_set_p_type), DIMENSION(:), POINTER :: nl_2c
-      TYPE(neighbor_list_3c_type)                         :: nl_3c
-      TYPE(dbt_pgrid_type)                               :: pgrid
-      TYPE(dbt_distribution_type)                        :: t_dist
-      ! TODO(dev dump, remove before PR): RI_range runtime knob
-      LOGICAL                                            :: qexist_ri
-      REAL(KIND=dp)                                      :: ri_range_prv = 1.0E-6_dp
-      ! TODO(dev dump, remove before PR): V dump unit + view buffer
-      INTEGER                                            :: unit_dump
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: vblk
-      ! MPI: size-1 sub-environment for the redundant per-rank 3c build
       TYPE(mp_para_env_type)                             :: para_env_1
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+      TYPE(neighbor_list_3c_type)                        :: nl_3c
+      TYPE(neighbor_list_set_p_type), DIMENSION(:), &
+         POINTER                                         :: nl_2c
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: dist_1, dist_2, dist_3
+
+! TODO(dev dump, remove before PR): RI_range runtime knob
+! TODO(dev dump, remove before PR): V dump unit + view buffer
+! MPI: size-1 sub-environment for the redundant per-rank 3c build
 
       NULLIFY (dft_control, dist_2d, para_env, particle_set, qs_kind_set, nl_2c, blk_2c, &
                col_bsize, row_bsize)
@@ -1630,21 +1701,20 @@ CONTAINS
       TYPE(dbt_type), DIMENSION(:, :), INTENT(INOUT)     :: t_3c_pari
       INTEGER, DIMENSION(:), INTENT(IN)                  :: pair_i, pair_j, pair_img
 
-      CHARACTER(LEN=*), PARAMETER :: routineN = 'pari_solve_pairs'
-      CHARACTER(LEN=64)                                  :: progbuf, progmsg
-      REAL(KIND=dp)                                      :: t_stage
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'pari_solve_pairs'
 
-      INTEGER :: b_img, cell(3), handle, i, iatom, ienv, ipair, ithr, jatom, l, mb_img, nAOi, nAOj, ncol, ndom, &
-                 ni, nj, npair, nthr, offset, unit_dump, unit_pool
-      INTEGER, DIMENSION(3)                              :: ind
-      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
+      CHARACTER(LEN=64)                                  :: progbuf, progmsg
+      INTEGER :: b_img, cell(3), handle, i, iatom, ienv, ipair, ithr, jatom, l, mb_img, nAOi, &
+         nAOj, ncol, ndom, ni, nj, npair, nthr, offset, unit_dump, unit_pool
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: img_to_mimg
       INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: img_cells
+      INTEGER, DIMENSION(3)                              :: ind
+      INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: found, qexist, same_site
-      REAL(KIND=dp)                                      :: rcond
+      REAL(KIND=dp)                                      :: fit_res, rcond, res_max
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: a2, c_full, vdom, vinv
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: blk_3c
-      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: vij, vii, vjj
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: vii, vij, vjj
       TYPE(kpoint_type), POINTER                         :: kpoints
       TYPE(mp_para_env_type), POINTER                    :: para_env
 
@@ -1723,11 +1793,12 @@ CONTAINS
       IF (para_env%num_pe == 1) OPEN (NEWUNIT=unit_dump, FILE="PARI_C3_DUMP")
       IF (para_env%num_pe == 1) OPEN (NEWUNIT=unit_pool, FILE="PARI_POOL_DUMP")
       progmsg = ""
+      res_max = 0.0_dp
 !$OMP PARALLEL DEFAULT(NONE) &
 !$OMP SHARED(ri_data, t_2c_pari, t_3c_pari, pair_i, pair_j, pair_img, npair, img_to_mimg, img_cells, para_env, &
-!$OMP        unit_dump, unit_pool, progmsg, pari_remote_cut, pari_sac_f, pari_eps_eig) &
+!$OMP        unit_dump, unit_pool, progmsg, pari_remote_cut, pari_sac_f, pari_eps_eig, res_max) &
 !$OMP PRIVATE(ipair, iatom, jatom, b_img, mb_img, same_site, ni, nj, nAOi, nAOj, ncol, ndom, offset, &
-!$OMP         ind, found, rcond, vdom, a2, c_full, vinv, blk_3c, vii, vij, vjj, progbuf, ithr, nthr)
+!$OMP         ind, found, rcond, vdom, a2, c_full, vinv, blk_3c, vii, vij, vjj, progbuf, ithr, nthr, fit_res)
       ithr = 0
       nthr = 1
 !$    ithr = omp_get_thread_num()
@@ -1797,11 +1868,14 @@ CONTAINS
                blk_3c = 0.0_dp
             END IF
             a2(ni + 1:ndom, :) = TRANSPOSE(RESHAPE( &
-                                  RESHAPE(blk_3c, [nAOi, nAOj, nj], order=[2, 1, 3]), [nAOi*nAOj, nj]))
+                                           RESHAPE(blk_3c, [nAOi, nAOj, nj], order=[2, 1, 3]), [nAOi*nAOj, nj]))
             DEALLOCATE (blk_3c)
          END IF
 
-         IF (SQRT(SUM(a2**2)) < 1.0E-8_dp .OR. SUM(ABS(img_cells(:, b_img))) >= pari_remote_cut) THEN
+         ! dead-pair skip, tied to the tensor filter (two orders above it, the
+         ! measured gap between overlap-dead and live 3c blocks; scale-aware
+         ! when the user tightens EPS_FILTER)
+         IF (SQRT(SUM(a2**2)) < 1.0E2_dp*ri_data%filter_eps .OR. SUM(ABS(img_cells(:, b_img))) >= pari_remote_cut) THEN
             ! dead or remote pair: the 3c products are overlap-dead (exactly
             ! zero, or pure integral-engine roundoff on a physically empty
             ! pair), or the pair cell lies beyond any orbital overlap at this
@@ -1815,6 +1889,18 @@ CONTAINS
             ri_data%pari_rcond_max = MAX(ri_data%pari_rcond_max, rcond)
 !$OMP END CRITICAL(pari_rcond_max)
             c_full = MATMUL(vinv, a2)
+            ! fit-residual probe: ||A - V C||_F / ||A||_F of the regularized
+            ! pair solve, before the same-site / same-atom scalings; grows when
+            ! the pair domain cannot represent A (kernel too long-ranged for
+            ! the home-only domains) -- cheap failure detector
+            fit_res = SQRT(SUM((a2 - MATMUL(vdom, c_full))**2))/MAX(SQRT(SUM(a2**2)), 1.0E-30_dp)
+!$OMP CRITICAL(pari_res_probe)
+            IF (fit_res > res_max) res_max = fit_res
+            IF (fit_res > 1.0E-2_dp) THEN
+               WRITE (*, '(A,3I5,ES10.3)') " PARI| fit residual >1e-2, pair (i,j,b): ", &
+                  iatom, jatom, b_img, fit_res
+            END IF
+!$OMP END CRITICAL(pari_res_probe)
             IF (same_site) c_full = 0.5_dp*c_full
             IF (iatom == jatom .AND. b_img /= 1) c_full = pari_sac_f*c_full
          END IF
@@ -1836,6 +1922,15 @@ CONTAINS
          DEALLOCATE (vdom, a2, c_full, vinv)
       END DO
 !$OMP END PARALLEL
+      ! fit-residual report (probe details above inside the solve loop);
+      ! residuals of 1e-3..1e-1 are the expected Levenberg-Marquardt bias of
+      ! the regularized solve (they track pari_eps_eig); O(1) residuals mean
+      ! the home-only pair domains cannot span this system / interaction range
+      WRITE (*, '(A,ES10.3)') " PARI| pair fit residual, worst over domains: ", res_max
+      IF (res_max > 5.0E-1_dp) THEN
+         CALL cp_warn(__LOCATION__, "PARI pair-domain fit residuals are O(1): the home-only "// &
+                      "domains cannot span this system / interaction range")
+      END IF
       IF (para_env%num_pe == 1) THEN
          CLOSE (unit_dump)
          CLOSE (unit_pool)
@@ -1868,73 +1963,8 @@ CONTAINS
 
    END SUBROUTINE pari_solve_pairs
 
-
 ! **************************************************************************************************
-!> \brief gather the pooled C3 blocks of atom iat into (ndom, nAO_iat, nao)
-! **************************************************************************************************
-   SUBROUTINE pari_gather_c3(ri_data, pair_map, iat, c3)
-      TYPE(hfx_ri_type), INTENT(IN)                     :: ri_data
-      INTEGER, DIMENSION(:, :), INTENT(IN)              :: pair_map
-      INTEGER, INTENT(IN)                               :: iat
-      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(OUT)    :: c3
-
-      INTEGER :: j, nAOi, nAOj, offq, pair_ab
-
-      nAOi = SIZE(c3, 2)
-      c3 = 0.0_dp
-      DO j = 1, SIZE(pair_map, 2)
-         pair_ab = pair_map(iat, j)
-         CPASSERT(pair_ab > 0)
-         offq = SUM(ri_data%bsizes_AO(1:j - 1))
-         nAOj = ri_data%bsizes_AO(j)
-         c3(1:SIZE(c3, 1), 1:nAOi, offq + 1:offq + nAOj) = RESHAPE( &
-            ri_data%pari_c3(ri_data%pari_c3_offset(pair_ab):ri_data%pari_c3_offset(pair_ab + 1) - 1), &
-            [SIZE(c3, 1), nAOi, nAOj])
-      END DO
-   END SUBROUTINE pari_gather_c3
-
-! **************************************************************************************************
-!> \brief src(a,b,c) -> dst(a*c, b) with (a,c) merged in the source scan order
-! **************************************************************************************************
-   SUBROUTINE pari_transpose_213(src, dst)
-      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(IN)      :: src
-      REAL(KIND=dp), DIMENSION(:, :), INTENT(OUT)        :: dst
-
-      INTEGER :: a, b, c, na, nb, nc
-
-      na = SIZE(src, 1); nb = SIZE(src, 2); nc = SIZE(src, 3)
-      CPASSERT(SIZE(dst, 1) == nb .AND. SIZE(dst, 2) == na*nc)
-      DO c = 1, nc
-         DO a = 1, na
-            DO b = 1, nb
-               dst(b, (c - 1)*na + a) = src(a, b, c)
-            END DO
-         END DO
-      END DO
-   END SUBROUTINE pari_transpose_213
-
-! **************************************************************************************************
-!> \brief src(a,b,c) -> dst(a*c, b) with (a,c) merged as a-major in dst columns
-! **************************************************************************************************
-   SUBROUTINE pari_transpose_132(src, dst)
-      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(IN)      :: src
-      REAL(KIND=dp), DIMENSION(:, :), INTENT(OUT)        :: dst
-
-      INTEGER :: a, b, c, na, nb, nc
-
-      na = SIZE(src, 1); nb = SIZE(src, 2); nc = SIZE(src, 3)
-      CPASSERT(SIZE(dst, 1) == na*nc .AND. SIZE(dst, 2) == nb)
-      DO c = 1, nc
-         DO a = 1, na
-            DO b = 1, nb
-               dst((c - 1)*na + a, b) = src(a, b, c)
-            END DO
-         END DO
-      END DO
-   END SUBROUTINE pari_transpose_132
-
-! **************************************************************************************************
-!> \brief fetch a 3c block; zero block if absent (below the integral filter)
+!> \brief ...
 !> \param tensor ...
 !> \param ind block indices (own atom, partner atom, aux atom)
 !> \param dims expected block shape
@@ -1943,7 +1973,8 @@ CONTAINS
    SUBROUTINE get_3c_or_zero(tensor, ind, dims, blk)
       TYPE(dbt_type), INTENT(INOUT)                      :: tensor
       INTEGER, DIMENSION(3), INTENT(IN)                  :: ind, dims
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), INTENT(OUT) :: blk
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), &
+         INTENT(OUT)                                     :: blk
 
       LOGICAL                                            :: found
 

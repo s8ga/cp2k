@@ -75,8 +75,7 @@ MODULE hfx_admm_utils
         do_admm_basis_projection, do_admm_charge_constrained_projection, do_admm_purify_none, &
         do_potential_coulomb, do_potential_id, do_potential_long, do_potential_mix_cl, &
         do_potential_mix_cl_trunc, do_potential_short, do_potential_truncated, &
-        hfx_ri_kp_method_pari, &
-        xc_funct_no_shortcut, xc_none
+        hfx_ri_kp_method_pari, xc_funct_no_shortcut, xc_none
    USE input_section_types,             ONLY: section_vals_duplicate,&
                                               section_vals_get,&
                                               section_vals_get_subs_vals,&
@@ -1091,6 +1090,16 @@ CONTAINS
          END IF
 
          IF (x_data(irep, 1)%ri_data%kp_method == hfx_ri_kp_method_pari) THEN
+            ! the PARI pair domains are home-only (no remote auxiliary
+            ! functions), validated for screened (HSE-type) exchange only;
+            ! a TRUNCATED or MIX_CL_TRUNC kernel needs the image-range
+            ! machinery of the default KP_METHOD GLOBAL path
+            SELECT CASE (x_data(irep, 1)%potential_parameter%potential_type)
+            CASE (do_potential_short)
+               ! supported
+            CASE DEFAULT
+               CPABORT("RI%KP_METHOD PARI supports SHORTRANGE potentials only; use KP_METHOD GLOBAL.")
+            END SELECT
             CALL hfx_ri_update_ks_kp_pari(qs_env, x_data(irep, 1)%ri_data, matrix_ks_orb, ehfx, &
                                           rho_ao_orb, s_mstruct_changed, nspins, &
                                           x_data(irep, 1)%general_parameter%fraction)
