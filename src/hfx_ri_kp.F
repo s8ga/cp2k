@@ -3829,6 +3829,7 @@ CONTAINS
          bsizes_RI_ext_split((i_RI - 1)*nblks_RI + 1:i_RI*nblks_RI) = ri_data%bsizes_RI_split(:)
       END DO
 
+      batch_size = ri_data%kp_stack_size
       pdims = 0
       CALL dbt_pgrid_create(para_env_sub, pdims, pgrid, &
                             tensor_dims=[1, SIZE(bsizes_RI_ext_split), batch_size*SIZE(ri_data%bsizes_AO_split)])
