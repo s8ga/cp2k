@@ -145,6 +145,7 @@ MODULE hfx_types
       REAL(dp)                                 :: scale_longrange = 0.0_dp !! scaling factor for mixed potential
       REAL(dp)                                 :: scale_gaussian = 0.0_dp!! scaling factor for mixed potential
       REAL(dp)                                 :: cutoff_radius = 0.0_dp!! cutoff radius if cutoff potential in use
+      LOGICAL                                  :: cutoff_radius_explicit = .FALSE. !! CUTOFF_RADIUS keyword given explicitly in input
       CHARACTER(default_path_length)           :: filename = ""
    END TYPE hfx_potential_type
 
@@ -762,6 +763,7 @@ CONTAINS
                      CPWARN(error_msg)
                   END IF
                   actual_x_data%potential_parameter%cutoff_radius = real_val
+                  actual_x_data%potential_parameter%cutoff_radius_explicit = .TRUE.
                END IF
             END IF
             IF (actual_x_data%potential_parameter%potential_type == do_potential_id) THEN
@@ -1112,6 +1114,7 @@ CONTAINS
          hfx_pot%potential_type = x_data%potential_parameter%potential_type
          hfx_pot%omega = x_data%potential_parameter%omega
          hfx_pot%cutoff_radius = x_data%potential_parameter%cutoff_radius
+         hfx_pot%cutoff_radius_explicit = x_data%potential_parameter%cutoff_radius_explicit
          hfx_pot%scale_coulomb = x_data%potential_parameter%scale_coulomb
          hfx_pot%scale_longrange = x_data%potential_parameter%scale_longrange
       END ASSOCIATE
@@ -1181,9 +1184,10 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER :: routineN = 'hfx_ri_init_read_input'
 
+      CHARACTER(LEN=default_string_length)           :: error_msg
       INTEGER                                            :: handle
       LOGICAL                                            :: explicit
-      REAL(dp)                                           :: eps_storage_scaling
+      REAL(dp)                                           :: eps_storage_scaling, r_eps
 
       CALL timeset(routineN, handle)
 
@@ -1207,6 +1211,12 @@ CONTAINS
          CALL section_vals_val_get(ri_section, "CUTOFF_RADIUS", r_val=ri_metric%cutoff_radius, explicit=explicit)
          IF (.NOT. explicit) THEN
             ri_metric%cutoff_radius = hfx_pot%cutoff_radius
+            ! metric explicitness is never inherited from the HFX potential: truncating a
+            ! shortrange metric below its EPS_SCHWARZ-consistent range can render the
+            ! extended-basis 2c matrix ill-conditioned (Cholesky failure)
+            ri_metric%cutoff_radius_explicit = .FALSE.
+         ELSE
+            ri_metric%cutoff_radius_explicit = .TRUE.
          END IF
 
          CALL section_vals_val_get(ri_section, "SCALE_COULOMB", r_val=ri_metric%scale_coulomb, explicit=explicit)
@@ -1219,8 +1229,16 @@ CONTAINS
             ri_metric%scale_longrange = hfx_pot%scale_longrange
          END IF
 
-         IF (ri_metric%potential_type == do_potential_short) THEN
+         IF (ri_metric%potential_type == do_potential_short .AND. .NOT. ri_metric%cutoff_radius_explicit) THEN
             CALL erfc_cutoff(ri_data%eps_schwarz, ri_metric%omega, ri_metric%cutoff_radius)
+         ELSE IF (ri_metric%potential_type == do_potential_short) THEN
+            CALL erfc_cutoff(ri_data%eps_schwarz, ri_metric%omega, r_eps)
+            IF (ri_metric%cutoff_radius < r_eps) THEN
+               WRITE (error_msg, '(A)') &
+                  "Explicit RI CUTOFF_RADIUS is below the EPS_SCHWARZ-consistent range: "// &
+                  "the 2-center metric matrices may become ill-conditioned"
+               CPWARN(error_msg)
+            END IF
          END IF
          IF (ri_metric%potential_type == do_potential_id) ri_metric%cutoff_radius = 0.0_dp
       END ASSOCIATE
@@ -1302,13 +1320,15 @@ CONTAINS
       nproc = para_env%num_pe
 
       ASSOCIATE (ri_metric => ri_data%ri_metric, hfx_pot => ri_data%hfx_pot)
-         IF (ri_metric%potential_type == do_potential_short) THEN
+         IF (ri_metric%potential_type == do_potential_short .AND. .NOT. ri_metric%cutoff_radius_explicit) THEN
             CALL erfc_cutoff(ri_data%eps_schwarz, ri_metric%omega, ri_metric%cutoff_radius)
          END IF
 
-         IF (hfx_pot%potential_type == do_potential_short) THEN
+         IF (hfx_pot%potential_type == do_potential_short .AND. .NOT. hfx_pot%cutoff_radius_explicit) THEN
             ! need a more accurate threshold for determining 2-center integral operator range
-            ! because stability of matrix inversion/sqrt is sensitive to this
+            ! because stability of matrix inversion/sqrt is sensitive to this.
+            ! Runs for both gamma and k-point RI; on the k-point path this write is transient
+            ! (hfx_ri_kp re-derives), so guarding it is what keeps an explicit radius alive there.
             CALL erfc_cutoff(ri_data%filter_eps_2c, hfx_pot%omega, hfx_pot%cutoff_radius)
          END IF
          ! determine whether RI metric is same operator as used in HFX

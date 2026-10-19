@@ -37,6 +37,7 @@ MODULE integral_library_types
       INTEGER                        :: potential_type = do_potential_coulomb
       REAL(dp)                       :: omega = 0.0_dp ! SR: erfc(omega*r)/r
       REAL(dp)                       :: cutoff_radius = 0.0_dp ! TC cutoff/effective SR range
+      LOGICAL                        :: cutoff_radius_explicit = .FALSE. ! CUTOFF_RADIUS keyword given explicitly in input
       CHARACTER(default_path_length) :: filename = ""
       REAL(dp)                       :: scale_coulomb = 0.0_dp ! Only for WFC methods
       REAL(dp)                       :: scale_longrange = 0.0_dp ! Only for WFC methods

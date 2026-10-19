@@ -306,7 +306,10 @@ CONTAINS
                           "periodic cell, choose a radius compatible with the cell dimensions. The default value "// &
                           "for short-range potentials when this keyword is omitted is solved from "// &
                           "$\frac{\mathrm{erfc}(\omega \cdot r)}{r} = \epsilon_{\mathrm{schwarz}}$ "// &
-                          "by Newton-Raphson method, with $\epsilon_{\mathrm{schwarz}}$ set by SCREENING/EPS_SCHWARZ", &
+                          "by Newton-Raphson method, with $\epsilon_{\mathrm{schwarz}}$ set by SCREENING/EPS_SCHWARZ. "// &
+                          "An explicit value overrides the derived range of the potential and of the k-point "// &
+                          "image list: converge energies and properties with respect to this value. It does not "// &
+                          "change the RI metric range (see RI%CUTOFF_RADIUS).", &
                           usage="CUTOFF_RADIUS 10.0", type_of_var=real_t, & ! default_r_val=10.0_dp,&
                           unit_str="angstrom")
       CALL section_add_keyword(section, keyword)
@@ -563,8 +566,10 @@ CONTAINS
       CALL keyword_release(keyword)
 
       CALL keyword_create(keyword, __LOCATION__, name="CUTOFF_RADIUS", &
-                          description="The cutoff radius (in Angstroms) for the truncated Coulomb operator. "// &
-                          "Default is CUTOFF_RADIUS from INTERACTION_POTENTIAL. ", &
+                          description="The cutoff radius (in Angstroms) of the RI metric operator. For a "// &
+                          "short-range metric, the default is solved from erfc(omega*r)/r = EPS_SCHWARZ; "// &
+                          "values below that derived range can make the 2-center metric matrices "// &
+                          "ill-conditioned.", &
                           variants=["KP_CUTOFF_RADIUS"], &
                           default_r_val=0.0_dp, &
                           repeats=.FALSE., &

@@ -595,7 +595,8 @@ CONTAINS
       CHARACTER(len=*), PARAMETER :: routineN = 'admm_init_hamiltonians'
 
       INTEGER                                            :: handle, hfx_pot, ikind, nkind
-      LOGICAL                                            :: do_kpoints, mic, molecule_only
+      LOGICAL                                            :: do_kpoints, mic, molecule_only, &
+                                                            potential_cutoff_explicit
       LOGICAL, ALLOCATABLE, DIMENSION(:)                 :: aux_fit_present, orb_present
       REAL(dp)                                           :: eps_schwarz, omega, pdist, roperator, &
                                                             subcells
@@ -691,7 +692,17 @@ CONTAINS
          CASE (do_potential_short)
             CALL section_vals_val_get(hfx_sections, "INTERACTION_POTENTIAL%OMEGA", r_val=omega)
             CALL section_vals_val_get(hfx_sections, "SCREENING%EPS_SCHWARZ", r_val=eps_schwarz)
-            CALL erfc_cutoff(eps_schwarz, omega, roperator)
+            ! two-step read: the keyword has no default, requesting r_val on an
+            ! unset keyword would abort; keep the aux-basis range consistent with
+            ! the image set when the radius is explicit
+            CALL section_vals_val_get(hfx_sections, "INTERACTION_POTENTIAL%CUTOFF_RADIUS", &
+                                      explicit=potential_cutoff_explicit)
+            IF (potential_cutoff_explicit) THEN
+               CALL section_vals_val_get(hfx_sections, "INTERACTION_POTENTIAL%CUTOFF_RADIUS", &
+                                         r_val=roperator)
+            ELSE
+               CALL erfc_cutoff(eps_schwarz, omega, roperator)
+            END IF
          CASE DEFAULT
             CPABORT("HFX potential not available for K-points (NYI)")
          END SELECT

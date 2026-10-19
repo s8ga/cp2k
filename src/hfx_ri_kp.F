@@ -4345,13 +4345,16 @@ CONTAINS
 
       !In case of shortrange HFX potential, it is imprtant to be consistent with the rest of the KP
       !code, and use EPS_SCHWARZ to determine the range (rather than eps_filter_2c in normal RI-HFX)
+      !An explicit CUTOFF_RADIUS from the INTERACTION_POTENTIAL section takes precedence
       IF (ri_data%hfx_pot%potential_type == do_potential_short) THEN
-         CALL erfc_cutoff(ri_data%eps_schwarz, ri_data%hfx_pot%omega, ri_data%hfx_pot%cutoff_radius)
-         WRITE (warning_msg, '(A)') &
-            "The SHORTANGE HFX potential typically extends over many periodic images, "// &
-            "possibly slowing down the calculation. Consider using the TRUNCATED "// &
-            "potential for better computational performance."
-         CPWARN(warning_msg)
+         IF (.NOT. ri_data%hfx_pot%cutoff_radius_explicit) THEN
+            CALL erfc_cutoff(ri_data%eps_schwarz, ri_data%hfx_pot%omega, ri_data%hfx_pot%cutoff_radius)
+            WRITE (warning_msg, '(A)') &
+               "The SHORTANGE HFX potential typically extends over many periodic images, "// &
+               "possibly slowing down the calculation. Consider using the TRUNCATED "// &
+               "potential for better computational performance."
+            CPWARN(warning_msg)
+         END IF
       END IF
 
       !Determine the range for contributing periodic images, and for the RI basis extension
