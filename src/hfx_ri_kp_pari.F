@@ -28,7 +28,8 @@ MODULE hfx_ri_kp_pari
                                               dbcsr_distribution_type, dbcsr_get_block_p, &
                                               dbcsr_iterator_blocks_left, dbcsr_iterator_next_block, &
                                               dbcsr_iterator_start, dbcsr_iterator_stop, &
-                                              dbcsr_iterator_type, dbcsr_p_type, dbcsr_put_block, &
+                                              dbcsr_get_stored_coordinates, dbcsr_iterator_type, &
+                                              dbcsr_p_type, dbcsr_put_block, &
                                               dbcsr_release, dbcsr_replicate_all, dbcsr_type, &
                                               dbcsr_type_no_symmetry
    USE cp_dbcsr_operations,             ONLY: cp_dbcsr_dist2d_to_dist
@@ -282,21 +283,31 @@ CONTAINS
       INTEGER, DIMENSION(3)                             :: dc
       INTEGER, DIMENSION(:, :), POINTER                 :: index_to_cell
       INTEGER, DIMENSION(:, :, :), POINTER              :: cell_to_index
+      TYPE(mp_para_env_type), POINTER                   :: para_env
       REAL(KIND=dp)                                     :: d1y, d1z, d4e, d4v, d4w, half, trb, worst_sym
       LOGICAL                                            :: lpair
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)          :: c3norm, c3norms, c3t, Gflat, Gj, Hflat, pdiff_norm
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)          :: c3norm, c3norms, Gflat, Gj, Hflat, pdiff_norm
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)       :: ptmp, vblk
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)    :: bd2_blk, fimg, pdiff
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :) :: fimg_t
       ! TODO(dev diagnostic, remove before PR): far-chain source accumulators
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :) :: f1src_y, f1src_z, f4src_e, f4src_v, f4src_w
+      ! MPI: replicated density images + KS block owner
+      TYPE(dbcsr_p_type), ALLOCATABLE, DIMENSION(:) :: rho_rep
+      INTEGER :: owner
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :) :: bd_all
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :, :) :: bd2buf
+      ! bd2: (p, lam_global, mu, iz) -- the per-l planes are one nao-wide slab so
+      ! the T4 fill is ONE dgemm per (k, x, z, mu) against the whole P row block
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :, :) :: bd2buf
+      ! b7c stacks (T4 iz / T2 y): per-group live lists, packed A, stacked W
+      INTEGER :: iw, nwl, nzl, izl, rr, nyl_l
+      INTEGER, ALLOCATABLE, DIMENSION(:) :: w_iz, w_im, w_off, izl_of, yl_y, yl_off
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :) :: Ap, Wt, Ap2, Wt2
       REAL(KIND=dp), DIMENSION(:, :), POINTER           :: blk
       TYPE(dbcsr_iterator_type)                          :: iter
       TYPE(kpoint_type), POINTER                         :: kpoints
 
-      NULLIFY (kpoints, cell_to_index, index_to_cell, blk)
+      NULLIFY (kpoints, cell_to_index, index_to_cell, blk, para_env)
       CALL timeset(routineN, handle)
 
       ! TODO(dev experiment, remove before PR): per-term ablation switch,
@@ -322,8 +333,10 @@ CONTAINS
          CLOSE (ienv)
       END IF
       ! TODO(dev diagnostic, remove before PR): opt-in diagnostics
+      ! (single-rank only: the per-term accumulators live inside the
+      ! rank-split atom loop and would be partial otherwise)
       INQUIRE (FILE="PARI_KEEP_DIAG", EXIST=qexist)
-      IF (qexist) pari_diag = .TRUE.
+      IF (qexist .AND. para_env%num_pe == 1) pari_diag = .TRUE.
 
       CPASSERT(SIZE(rho_ao, 1) == 1) ! spin-generalisation is a follow-up
 
@@ -331,7 +344,7 @@ CONTAINS
       nao = SUM(ri_data%bsizes_AO)
       nimg = ri_data%pari_nimg
 
-      CALL get_qs_env(qs_env, kpoints=kpoints)
+      CALL get_qs_env(qs_env, kpoints=kpoints, para_env=para_env)
       CALL get_kpoint_info(kpoints, cell_to_index=cell_to_index, index_to_cell=index_to_cell)
 
       ! image cells, opposite-image and relative-image tables
@@ -371,9 +384,18 @@ CONTAINS
       ! opposite (P_ab^z = P_ba^-z); the same-atom blocks of a mirror pair are
       ! stored twice and both deposits land on the image diagonal, hence 0.5.
       ALLOCATE (pdiff(nao, nao, nimg), ptmp(nao, nao))
+      ! MPI: replicated density images (nao^2, small) so the parity-rule fold
+      ! sees every block on every rank; the caller's matrices stay untouched
+      ALLOCATE (rho_rep(nimg))
+      DO b_img = 1, nimg
+         ALLOCATE (rho_rep(b_img)%matrix)
+         CALL dbcsr_create(rho_rep(b_img)%matrix, template=rho_ao(1, b_img)%matrix)
+         CALL dbcsr_copy(rho_rep(b_img)%matrix, rho_ao(1, b_img)%matrix)
+         CALL dbcsr_replicate_all(rho_rep(b_img)%matrix)
+      END DO
       pdiff = 0.0_dp
       DO b_img = 1, nimg
-         CALL dbcsr_iterator_start(iter, rho_ao(1, b_img)%matrix)
+         CALL dbcsr_iterator_start(iter, rho_rep(b_img)%matrix)
          DO WHILE (dbcsr_iterator_blocks_left(iter))
             CALL dbcsr_iterator_next_block(iter, Aat, Bat, blk)
             offI = SUM(ri_data%bsizes_AO(1:Aat - 1)); nAOi = ri_data%bsizes_AO(Aat)
@@ -407,6 +429,10 @@ CONTAINS
       DO b_img = 1, nimg
          IF (mimg(b_img) == 0) pdiff(:, :, b_img) = 0.0_dp
       END DO
+      DO b_img = 1, nimg
+         CALL dbcsr_release(rho_rep(b_img)%matrix)
+      END DO
+      DEALLOCATE (rho_rep)
       ALLOCATE (pdiff_norm(nimg))
       DO b_img = 1, nimg
          pdiff_norm(b_img) = SQRT(SUM(pdiff(:, :, b_img)**2))
@@ -516,41 +542,16 @@ CONTAINS
       ALLOCATE (bd2_blk(nrimax, naomax, naomax))
       ALLOCATE (Gj(naomax*nrimax*naomax))
       ALLOCATE (y_list(nimg), ylive(nimg), pd_rev(nimg))
-      ALLOCATE (bd2buf(nrimax, naomax, naomax, MAX(1, npd), natom))
+      ALLOCATE (bd2buf(nrimax, nao, naomax, MAX(1, npd)))
       pd_rev = 0
       DO iz = 1, npd
          pd_rev(pd_list(iz)) = iz
       END DO
 
-      ! transposed pool copy c3t, (p, mu_own, nu_partner) -> (p, nu_partner, mu_own):
-      ! the T2/T4 right factors are own=j pairs, whose joint (q, lam) folding needs
-      ! the partner AO index adjacent to the RI index; the layout is certified
-      ! offline (slice2b/b7_batched.py). Same segment offsets as pari_c3.
-      ALLOCATE (c3t(SIZE(ri_data%pari_c3)))
-!$OMP PARALLEL DEFAULT(NONE) &
-!$OMP SHARED(ri_data, c3t) &
-!$OMP PRIVATE(ip, k, j, nRIk, nAOk, nAOj, o0, mu, nu, ithr, nthr)
-      ithr = 0
-      nthr = 1
-!$     ithr = omp_get_thread_num()
-!$     nthr = omp_get_max_threads()
-      DO ip = 1, SIZE(ri_data%pari_pair_i)
-         IF (MOD(ip - 1, nthr) /= ithr) CYCLE
-         k = ri_data%pari_pair_i(ip)
-         j = ri_data%pari_pair_j(ip)
-         nRIk = ri_data%bsizes_RI(k); nAOk = ri_data%bsizes_AO(k); nAOj = ri_data%bsizes_AO(j)
-         o0 = ri_data%pari_c3_offset(ip) - 1
-         DO nu = 1, nAOj
-            DO mu = 1, nAOk
-               c3t(o0 + 1 + (nu - 1)*nRIk + (mu - 1)*nRIk*nAOj:o0 + nu*nRIk + (mu - 1)*nRIk*nAOj) = &
-                  ri_data%pari_c3(o0 + 1 + (mu - 1)*nRIk + (nu - 1)*nRIk*nAOk: &
-                                  o0 + mu*nRIk + (nu - 1)*nRIk*nAOk)
-            END DO
-         END DO
-      END DO
-!$OMP END PARALLEL
-
       DO i = 1, natom
+         ! MPI: atoms interleaved over ranks; fimg row blocks are disjoint
+         ! (the four terms of atom i write only rows offI+1:offI+nAOi)
+         IF (MOD(i - 1, para_env%num_pe) /= para_env%mepos) CYCLE
          nRIi = ri_data%bsizes_RI(i); nAOi = ri_data%bsizes_AO(i)
          offI = SUM(ri_data%bsizes_AO(1:i - 1))
          WRITE (progbuf, '(I0,A,I0)') i, "/", natom
@@ -824,15 +825,15 @@ CONTAINS
          ! V is indexed by v = b - x and the right fit by w = y - b, so
          ! z = w + v with the implicit y = w + b required to be a valid
          ! y_list image (the original y walk); the per-(w) contraction folds
-         ! lam into one joint GEMM against the transposed pool copy c3t
          ki_tot = live_off(natom, i) + live_cnt(natom, i) - live_off(1, i)
          t_stage = m_walltime()
 !$OMP PARALLEL DEFAULT(NONE) &
 !$OMP SHARED(pari_term_mask, i, ri_data, natom, nimg, nao, npd, nrimax, naomax, cell_to_index, imgcell, live_off, live_cnt, &
 !$OMP        pari_vgate, pari_hard_gate, live_y, live_ip, pd_list, pd_rev, pdiff, reldiff, mimg, ylive, pair3s, c3norms, bd2buf, &
-!$OMP        fimg, c3t, nAOi, offI, ki_tot, fimg_t, f4src_e, f4src_v, f4src_w, pari_diag) &
+!$OMP        fimg, nAOi, offI, ki_tot, fimg_t, f4src_e, f4src_v, f4src_w, pari_diag) &
 !$OMP PRIVATE(k, nRIk, nAOk, offK, ie, x_img, iz, z_img, l, nAOl, offL, mu, jb, j, nRIj, nAOj, offJ, &
-!$OMP        b_img, v_img, w_img, y_img, lam, Gj, vblk, ithr, nthr, npct, lpct, progbuf)
+!$OMP        b_img, v_img, w_img, y_img, lam, Gj, vblk, ithr, nthr, npct, lpct, progbuf, iw, nwl, nzl, &
+!$OMP        izl, rr, w_iz, w_im, w_off, izl_of, Ap, Wt)
          ithr = 0
          nthr = 1
          lpct = 0
@@ -842,6 +843,7 @@ CONTAINS
          IF (ALLOCATED (vblk)) DEALLOCATE (vblk)
          ALLOCATE (Gj(naomax*nrimax*naomax))
          ALLOCATE (vblk(nrimax, nrimax))
+         ALLOCATE (w_iz(nimg), w_im(nimg), w_off(nimg), izl_of(MAX(1, npd)))
          DO k = 1, natom
             nRIk = ri_data%bsizes_RI(k); nAOk = ri_data%bsizes_AO(k)
             offK = SUM(ri_data%bsizes_AO(1:k - 1))
@@ -851,16 +853,15 @@ CONTAINS
                DO iz = 1, npd
                   IF (MOD(iz - 1, nthr) /= ithr) CYCLE
                   z_img = pd_list(iz)
-                  DO l = 1, natom
-                     nAOl = ri_data%bsizes_AO(l)
-                     offL = SUM(ri_data%bsizes_AO(1:l - 1))
-                     DO mu = 1, nAOi
-                        CALL dgemm('N', 'N', nRIk, nAOl, nAOk, 1.0_dp, &
-                                   ri_data%pari_c3(ri_data%pari_c3_offset(live_ip(ie)) + &
-                                                   (mu - 1)*nRIk*nAOk), nRIk, &
-                                   pdiff(offK + 1, offL + 1, z_img), nao, 0.0_dp, &
-                                   bd2buf(1, 1, mu, iz, l), nrimax)
-                     END DO
+                  ! one nao-wide GEMM per mu: the C3 mu-slab against the whole
+                  ! density row block of atom k (every partner column at once);
+                  ! the consumers read their lam range at offL + lam
+                  DO mu = 1, nAOi
+                     CALL dgemm('N', 'N', nRIk, nao, nAOk, 1.0_dp, &
+                                ri_data%pari_c3(ri_data%pari_c3_offset(live_ip(ie)) + &
+                                                (mu - 1)*nRIk*nAOk), nRIk, &
+                                pdiff(offK + 1, 1, z_img), nao, 0.0_dp, &
+                                bd2buf(1, 1, mu, iz), nrimax)
                   END DO
                END DO
 !$OMP BARRIER
@@ -879,6 +880,14 @@ CONTAINS
                   IF (SQRT(SUM(vblk(:nRIk, :nRIj)**2)) == 0.0_dp) CYCLE
                   DO l = 1, natom
                      nAOl = ri_data%bsizes_AO(l)
+                     offL = SUM(ri_data%bsizes_AO(1:l - 1))
+                     ! collect the live (w -> z) set with the gates of the
+                     ! original walk, in the original w order
+                     nwl = 0
+                     nzl = 0
+                     DO iz = 1, npd
+                        izl_of(iz) = 0
+                     END DO
                      DO w_img = 1, nimg
                         IF (pair3s(j, l, w_img) == 0) CYCLE
                         IF (c3norms(pair3s(j, l, w_img)) <= 1.0E-12_dp) CYCLE
@@ -891,36 +900,65 @@ CONTAINS
                         IF (z_img == 0) CYCLE
                         iz = pd_rev(z_img)
                         IF (iz == 0) CYCLE
-                        DO lam = 1, nAOl
-                           CALL dgemm('T', 'N', nAOi, nRIj, nRIk, 1.0_dp, bd2buf(1, lam, 1, iz, l), &
-                                      nrimax*naomax, vblk, nrimax, 0.0_dp, &
-                                      Gj((lam - 1)*nAOi*nRIj + 1), nAOi)
-                        END DO
-                        CALL dgemm('N', 'N', nAOi, nAOj, nRIj*nAOl, 1.0_dp, Gj, nAOi, &
-                                   c3t(ri_data%pari_c3_offset(pair3s(j, l, w_img))), nRIj*nAOl, &
-                                   1.0_dp, fimg(offI + 1, offJ + 1, b_img), nao)
-                        ! TODO(dev diagnostic, remove before PR): per-term + far-chain
-                        IF (pari_diag) THEN
-                           CALL dgemm('N', 'N', nAOi, nAOj, nRIj*nAOl, 1.0_dp, Gj, nAOi, &
-                                      c3t(ri_data%pari_c3_offset(pair3s(j, l, w_img))), nRIj*nAOl, &
-                                      1.0_dp, fimg_t(offI + 1, offJ + 1, b_img, 4), nao)
-                           IF (SUM(ABS(imgcell(:, live_y(ie)))) >= pari_hard_gate) THEN
-                              CALL dgemm('N', 'N', nAOi, nAOj, nRIj*nAOl, 1.0_dp, Gj, nAOi, &
-                                         c3t(ri_data%pari_c3_offset(pair3s(j, l, w_img))), nRIj*nAOl, &
-                                         1.0_dp, f4src_e(offI + 1, offJ + 1, b_img), nao)
-                           END IF
-                           IF (SUM(ABS(imgcell(:, v_img))) >= pari_hard_gate) THEN
-                              CALL dgemm('N', 'N', nAOi, nAOj, nRIj*nAOl, 1.0_dp, Gj, nAOi, &
-                                         c3t(ri_data%pari_c3_offset(pair3s(j, l, w_img))), nRIj*nAOl, &
-                                         1.0_dp, f4src_v(offI + 1, offJ + 1, b_img), nao)
-                           END IF
-                           IF (SUM(ABS(imgcell(:, w_img))) >= pari_hard_gate) THEN
-                              CALL dgemm('N', 'N', nAOi, nAOj, nRIj*nAOl, 1.0_dp, Gj, nAOi, &
-                                         c3t(ri_data%pari_c3_offset(pair3s(j, l, w_img))), nRIj*nAOl, &
-                                         1.0_dp, f4src_w(offI + 1, offJ + 1, b_img), nao)
-                           END IF
+                        nwl = nwl + 1
+                        w_iz(nwl) = iz
+                        w_im(nwl) = w_img
+                        w_off(nwl) = ri_data%pari_c3_offset(pair3s(j, l, w_img))
+                        IF (izl_of(iz) == 0) THEN
+                           nzl = nzl + 1
+                           izl_of(iz) = nzl
                         END IF
                      END DO
+                     IF (nwl == 0) CYCLE
+                     ALLOCATE (Ap(nrimax, nAOi*nzl), Wt(nRIj, nAOi*nzl))
+                     ! b7c iz-stack one lam at a time (certified, slice2b/
+                     ! b9_joint.py): ONE stacked GEMM per lam covers every
+                     ! needed z image, and each (w, lam) scatter reads the
+                     ! own=j pool segment's (p, mu) plane of THIS lam directly
+                     ! (contiguous, lda = nRIj) -- no transposed pool copy and
+                     ! no joint G buffer
+                     DO lam = 1, nAOl
+                        DO iz = 1, npd
+                           izl = izl_of(iz)
+                           IF (izl == 0) CYCLE
+                           DO mu = 1, nAOi
+                              Ap(1:nRIk, (izl - 1)*nAOi + mu) = bd2buf(1:nRIk, offL + lam, mu, iz)
+                           END DO
+                        END DO
+                        CALL dgemm('T', 'N', nRIj, nzl*nAOi, nRIk, 1.0_dp, vblk, nrimax, &
+                                   Ap, nrimax, 0.0_dp, Wt, nRIj)
+                        DO iw = 1, nwl
+                           izl = izl_of(w_iz(iw))
+                           DO rr = 1, nRIj
+                              Gj((rr - 1)*nAOi + 1:rr*nAOi) = Wt(rr, (izl - 1)*nAOi + 1:izl*nAOi)
+                           END DO
+                           CALL dgemm('N', 'N', nAOi, nAOj, nRIj, 1.0_dp, Gj, nAOi, &
+                                      ri_data%pari_c3(w_off(iw) + (lam - 1)*nRIj*nAOj), nRIj, &
+                                      1.0_dp, fimg(offI + 1, offJ + 1, b_img), nao)
+                           ! TODO(dev diagnostic, remove before PR): per-term + far-chain
+                           IF (pari_diag) THEN
+                              CALL dgemm('N', 'N', nAOi, nAOj, nRIj, 1.0_dp, Gj, nAOi, &
+                                         ri_data%pari_c3(w_off(iw) + (lam - 1)*nRIj*nAOj), nRIj, &
+                                         1.0_dp, fimg_t(offI + 1, offJ + 1, b_img, 4), nao)
+                              IF (SUM(ABS(imgcell(:, live_y(ie)))) >= pari_hard_gate) THEN
+                                 CALL dgemm('N', 'N', nAOi, nAOj, nRIj, 1.0_dp, Gj, nAOi, &
+                                            ri_data%pari_c3(w_off(iw) + (lam - 1)*nRIj*nAOj), nRIj, &
+                                            1.0_dp, f4src_e(offI + 1, offJ + 1, b_img), nao)
+                              END IF
+                              IF (SUM(ABS(imgcell(:, v_img))) >= pari_hard_gate) THEN
+                                 CALL dgemm('N', 'N', nAOi, nAOj, nRIj, 1.0_dp, Gj, nAOi, &
+                                            ri_data%pari_c3(w_off(iw) + (lam - 1)*nRIj*nAOj), nRIj, &
+                                            1.0_dp, f4src_v(offI + 1, offJ + 1, b_img), nao)
+                              END IF
+                              IF (SUM(ABS(imgcell(:, w_im(iw)))) >= pari_hard_gate) THEN
+                                 CALL dgemm('N', 'N', nAOi, nAOj, nRIj, 1.0_dp, Gj, nAOi, &
+                                            ri_data%pari_c3(w_off(iw) + (lam - 1)*nRIj*nAOj), nRIj, &
+                                            1.0_dp, f4src_w(offI + 1, offJ + 1, b_img), nao)
+                              END IF
+                           END IF
+                        END DO
+                     END DO
+                     DEALLOCATE (Ap, Wt)
                   END DO
                END DO
 !$OMP BARRIER
@@ -935,7 +973,7 @@ CONTAINS
                END IF
             END DO
          END DO
-         DEALLOCATE (Gj, vblk)
+         DEALLOCATE (Gj, vblk, w_iz, w_im, w_off, izl_of)
 !$OMP END PARALLEL
          WRITE (progbuf, '(A,I0,A,I0,A,F8.1,A)') "KS assembly: T4 done atom ", i, "/", natom, &
             " (wall ", m_walltime() - t_stage, " s)"
@@ -943,12 +981,14 @@ CONTAINS
 
          ! ================= T2: BD_i . V^b[i,j] . C3(j, l, y-b); V depends on
          ! the output image b, so no hoist is available (per-(i,j,b) groups);
-         ! the per-(l,y) contraction folds lam into one joint GEMM against c3t
+         ! per lam ONE stacked GEMM covers the live y set, then per (y, lam)
+         ! scatters read the pool planes directly (b9_joint.py)
          t_stage = m_walltime()
 !$OMP PARALLEL DEFAULT(NONE) &
 !$OMP SHARED(pari_term_mask, i, ri_data, natom, nimg, nao, nrimax, naomax, nyl, y_list, bd_all, fimg, reldiff, pair3s, &
-!$OMP        c3norms, c3t, nRIi, nAOi, offI, fimg_t, pari_diag) &
-!$OMP PRIVATE(jb, j, nAOj, nRIj, offJ, b_img, l, nAOl, offL, iy, y_img, z2, lam, vblk, Gj, ithr, nthr)
+!$OMP        c3norms, nRIi, nAOi, offI, fimg_t, pari_diag) &
+!$OMP PRIVATE(jb, j, nAOj, nRIj, offJ, b_img, l, nAOl, offL, iy, y_img, z2, lam, vblk, Gj, ithr, nthr, &
+!$OMP        nyl_l, yl_y, yl_off, Ap2, Wt2, mu, rr)
          ithr = 0
          nthr = 1
 !$       ithr = omp_get_thread_num()
@@ -957,6 +997,7 @@ CONTAINS
          IF (ALLOCATED (Gj)) DEALLOCATE (Gj)
          ALLOCATE (vblk(nrimax, nrimax))
          ALLOCATE (Gj(naomax*nrimax*naomax))
+         ALLOCATE (yl_y(nyl), yl_off(nyl))
          DO jb = 1, MERGE(natom*nimg, 0, IAND(pari_term_mask, 2) /= 0)
             IF (MOD(jb - 1, nthr) /= ithr) CYCLE
             j = (jb - 1)/nimg + 1
@@ -969,29 +1010,51 @@ CONTAINS
             DO l = 1, natom
                nAOl = ri_data%bsizes_AO(l)
                offL = SUM(ri_data%bsizes_AO(1:l - 1))
+               ! collect the live (y -> z2) set in the original walk order
+               nyl_l = 0
                DO iy = 1, nyl
                   y_img = y_list(iy)
                   z2 = reldiff(y_img, b_img)
                   IF (z2 <= 0) CYCLE
                   IF (pair3s(j, l, z2) == 0) CYCLE
                   IF (c3norms(pair3s(j, l, z2)) <= 1.0E-12_dp) CYCLE
-                  DO lam = 1, nAOl
-                     CALL dgemm('T', 'N', nAOi, nRIj, nRIi, 1.0_dp, bd_all(1, 1, offL + lam, y_img), nRIi, &
-                                vblk, nrimax, 0.0_dp, Gj((lam - 1)*nAOi*nRIj + 1), nAOi)
-                  END DO
-                  CALL dgemm('N', 'N', nAOi, nAOj, nRIj*nAOl, 1.0_dp, Gj, nAOi, &
-                             c3t(ri_data%pari_c3_offset(pair3s(j, l, z2))), nRIj*nAOl, &
-                             1.0_dp, fimg(offI + 1, offJ + 1, b_img), nao)
-                  ! TODO(dev diagnostic, remove before PR): per-term F
-                  IF (pari_diag) THEN
-                     CALL dgemm('N', 'N', nAOi, nAOj, nRIj*nAOl, 1.0_dp, Gj, nAOi, &
-                                c3t(ri_data%pari_c3_offset(pair3s(j, l, z2))), nRIj*nAOl, &
-                                1.0_dp, fimg_t(offI + 1, offJ + 1, b_img, 2), nao)
-                  END IF
+                  nyl_l = nyl_l + 1
+                  yl_y(nyl_l) = y_img
+                  yl_off(nyl_l) = ri_data%pari_c3_offset(pair3s(j, l, z2))
                END DO
+               IF (nyl_l == 0) CYCLE
+               ALLOCATE (Ap2(nrimax, nAOi*nyl_l), Wt2(nRIj, nAOi*nyl_l))
+               ! b7c y-stack one lam at a time (certified, slice2b/b9_joint.py):
+               ! ONE stacked GEMM per lam covers every live y, and each (y, lam)
+               ! scatter reads the own=j pool segment's (p, mu) plane of THIS
+               ! lam directly (contiguous, lda = nRIj) -- no transposed copy
+               DO lam = 1, nAOl
+                  DO iy = 1, nyl_l
+                     DO mu = 1, nAOi
+                        Ap2(1:nRIi, (iy - 1)*nAOi + mu) = bd_all(1:nRIi, mu, offL + lam, yl_y(iy))
+                     END DO
+                  END DO
+                  CALL dgemm('T', 'N', nRIj, nyl_l*nAOi, nRIi, 1.0_dp, vblk, nrimax, &
+                             Ap2, nrimax, 0.0_dp, Wt2, nRIj)
+                  DO iy = 1, nyl_l
+                     DO rr = 1, nRIj
+                        Gj((rr - 1)*nAOi + 1:rr*nAOi) = Wt2(rr, (iy - 1)*nAOi + 1:iy*nAOi)
+                     END DO
+                     CALL dgemm('N', 'N', nAOi, nAOj, nRIj, 1.0_dp, Gj, nAOi, &
+                                ri_data%pari_c3(yl_off(iy) + (lam - 1)*nRIj*nAOj), nRIj, &
+                                1.0_dp, fimg(offI + 1, offJ + 1, b_img), nao)
+                     ! TODO(dev diagnostic, remove before PR): per-term F
+                     IF (pari_diag) THEN
+                        CALL dgemm('N', 'N', nAOi, nAOj, nRIj, 1.0_dp, Gj, nAOi, &
+                                   ri_data%pari_c3(yl_off(iy) + (lam - 1)*nRIj*nAOj), nRIj, &
+                                   1.0_dp, fimg_t(offI + 1, offJ + 1, b_img, 2), nao)
+                     END IF
+                  END DO
+               END DO
+               DEALLOCATE (Ap2, Wt2)
             END DO
          END DO
-         DEALLOCATE (vblk, Gj)
+         DEALLOCATE (vblk, Gj, yl_y, yl_off)
 !$OMP END PARALLEL
          WRITE (progbuf, '(A,I0,A,I0,A,F8.1,A)') "KS assembly: T2 done atom ", i, "/", natom, &
             " (wall ", m_walltime() - t_stage, " s)"
@@ -999,7 +1062,12 @@ CONTAINS
 
          DEALLOCATE (bd_all)
       END DO
-      DEALLOCATE (vblk, bd2_blk, Gj, y_list, ylive, pd_list, pd_rev, bd2buf, c3t)
+      DEALLOCATE (vblk, bd2_blk, Gj, y_list, ylive, pd_list, pd_rev, bd2buf)
+
+      ! MPI: complete the atom-split partial images on every rank (dense
+      ! sum over disjoint row blocks); everything downstream (symmetrization,
+      ! energy, KS puts, dumps) then runs on identical complete data
+      CALL para_env%sum(fimg)
 
       ! symmetrize the image pairs: the exact exchange satisfies F^b = (F^-b)^T,
       ! so any deviation is error (from one-sided screening or from noise of the
@@ -1036,6 +1104,7 @@ CONTAINS
       END IF
 
       !TODO(dev dump, remove before PR): per-image F, per-term F + symmetry, full P, V blocks
+      IF (para_env%mepos == para_env%num_pe - 1) THEN
       OPEN (NEWUNIT=unit_dump, FILE="PARI_K_DUMP")
       WRITE (unit_dump, *) nimg, nao, worst_sym
       WRITE (unit_dump, *) imgcell
@@ -1068,6 +1137,7 @@ CONTAINS
          END DO
       END IF
       CLOSE (unit_dump)
+      END IF
 
       ! energy, legacy convention: 0.5 sum_b Tr((-fac F^b) P^b)
       ehfx = 0.0_dp
@@ -1090,8 +1160,11 @@ CONTAINS
                src = b_img
                IF (MOD(Aat + Bat, 2) /= 0) src = mimg(b_img)
                IF (src == 0) CYCLE
-               CALL dbcsr_put_block(ks_matrix(1, b_img)%matrix, Aat, Bat, &
-                                    -fac*fimg(offI + 1:offI + nAOi, offJ + 1:offJ + nAOj, src))
+               CALL dbcsr_get_stored_coordinates(ks_matrix(1, b_img)%matrix, Aat, Bat, owner)
+               IF (owner == para_env%mepos) THEN
+                  CALL dbcsr_put_block(ks_matrix(1, b_img)%matrix, Aat, Bat, &
+                                       -fac*fimg(offI + 1:offI + nAOi, offJ + 1:offJ + nAOj, src))
+               END IF
             END DO
          END DO
       END DO
@@ -1232,6 +1305,8 @@ CONTAINS
       ! TODO(dev dump, remove before PR): V dump unit + view buffer
       INTEGER                                            :: unit_dump
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: vblk
+      ! MPI: size-1 sub-environment for the redundant per-rank 3c build
+      TYPE(mp_para_env_type)                             :: para_env_1
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       TYPE(qs_kind_type), DIMENSION(:), POINTER          :: qs_kind_set
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: dist_1, dist_2, dist_3
@@ -1253,9 +1328,10 @@ CONTAINS
       IF (ABS(ri_data%eps_pgf_orb - dft_control%qs_control%eps_pgf_orb) > 1.0E-16_dp) THEN
          CPABORT("RI%EPS_PGF_ORB and QS%EPS_PGF_ORB must be identical for RI-HFX k-points")
       END IF
-      IF (para_env%num_pe > 1) THEN
-         CPABORT("RI%KP_METHOD PARI is currently restricted to a single MPI rank")
-      END IF
+      ! MPI: the 3c tensors are built redundantly per rank on a size-1
+      ! sub-communicator (after the RI_range cut they hold home-aux blocks
+      ! only, i.e. pool-scale); the pair solves below are rank-split
+      CALL para_env_1%from_split(para_env, para_env%mepos)
 
       CALL pari_cleanup(ri_data)
 
@@ -1340,9 +1416,9 @@ CONTAINS
       ! (GLOBAL practice, hfx_ri_kp.F); legacy keeps the historical value for
       ! bitwise reproduction
       IF (pari_ri_mode == 0) THEN
-         CALL dbt_pgrid_create(para_env, pdims, pgrid, tensor_dims=[natom, natom, 1])
+         CALL dbt_pgrid_create(para_env_1, pdims, pgrid, tensor_dims=[natom, natom, 1])
       ELSE
-         CALL dbt_pgrid_create(para_env, pdims, pgrid, tensor_dims=[natom, natom, natom*ncell_RI_pari])
+         CALL dbt_pgrid_create(para_env_1, pdims, pgrid, tensor_dims=[natom, natom, natom*ncell_RI_pari])
       END IF
 
       CALL create_3c_tensor(t_3c_dummy, dist_1, dist_2, dist_3, pgrid, &
@@ -1498,6 +1574,7 @@ CONTAINS
       END DO
       CLOSE (unit_dump)
       DEALLOCATE (vblk)
+      CALL para_env_1%free()
 
       CALL timestop(handle)
 
@@ -1617,6 +1694,7 @@ CONTAINS
                                              ni*ri_data%bsizes_AO(pair_i(ipair))*ri_data%bsizes_AO(pair_j(ipair))
       END DO
       ALLOCATE (ri_data%pari_c3(ri_data%pari_c3_offset(npair + 1) - 1))
+      ri_data%pari_c3 = 0.0_dp ! rank-split fills disjoint segments; sum below
       ALLOCATE (ri_data%pari_nrow_i(npair))
       ri_data%pari_nrow_i(:) = ri_data%bsizes_RI(pair_i(:))
 
@@ -1642,8 +1720,8 @@ CONTAINS
          CLOSE (ienv)
       END IF
       !TODO(dev dump, remove before PR): C3 pool dump for the pyscf oracle gate
-      IF (para_env%mepos == para_env%num_pe - 1) OPEN (NEWUNIT=unit_dump, FILE="PARI_C3_DUMP")
-      IF (para_env%mepos == para_env%num_pe - 1) OPEN (NEWUNIT=unit_pool, FILE="PARI_POOL_DUMP")
+      IF (para_env%num_pe == 1) OPEN (NEWUNIT=unit_dump, FILE="PARI_C3_DUMP")
+      IF (para_env%num_pe == 1) OPEN (NEWUNIT=unit_pool, FILE="PARI_POOL_DUMP")
       progmsg = ""
 !$OMP PARALLEL DEFAULT(NONE) &
 !$OMP SHARED(ri_data, t_2c_pari, t_3c_pari, pair_i, pair_j, pair_img, npair, img_to_mimg, img_cells, para_env, &
@@ -1655,7 +1733,7 @@ CONTAINS
 !$    ithr = omp_get_thread_num()
 !$    nthr = omp_get_max_threads()
       DO ipair = 1, npair
-         IF (MOD(ipair - 1, nthr) /= ithr) CYCLE
+         IF (MOD(ipair - 1, nthr*para_env%num_pe) /= para_env%mepos*nthr + ithr) CYCLE
          IF (MOD(ipair, MAX(1, npair/20)) == 0) THEN
 !$OMP CRITICAL(pari_banner)
             WRITE (progbuf, '(I0,A,I0)') ipair, " / ", npair
@@ -1741,10 +1819,9 @@ CONTAINS
             IF (iatom == jatom .AND. b_img /= 1) c_full = pari_sac_f*c_full
          END IF
          ri_data%pari_c3(offset + 1:offset + ni*ncol) = RESHAPE(c_full(1:ni, :), [ni*ncol])
-         !TODO(dev dump, remove before PR): main-cell pairs only (the pyscf oracle
-         ! gate compares the molecular, i.e. same-cell, pair domains); a2 = the raw
-         ! 3c rows fed to the pseudo-inverse, for the null-projection audit
-         IF (para_env%mepos == para_env%num_pe - 1) THEN
+         !TODO(dev dump, remove before PR): main-cell pairs only (the pyscf
+         ! oracle gate); raw per-pair locals -- single-rank runs only
+         IF (para_env%num_pe == 1) THEN
 !$OMP CRITICAL(pari_c3_dump)
             IF (SUM(ABS(img_cells(:, b_img))) <= 1) THEN
                WRITE (unit_dump, *) iatom, jatom, b_img, ni, nAOi, nAOj, MERGE(1, 0, same_site)
@@ -1759,8 +1836,32 @@ CONTAINS
          DEALLOCATE (vdom, a2, c_full, vinv)
       END DO
 !$OMP END PARALLEL
-      IF (para_env%mepos == para_env%num_pe - 1) CLOSE (unit_dump)
-      IF (para_env%mepos == para_env%num_pe - 1) CLOSE (unit_pool)
+      IF (para_env%num_pe == 1) THEN
+         CLOSE (unit_dump)
+         CLOSE (unit_pool)
+      ELSE
+         ! MPI: reduce the rank-split pool; then the last rank walks the
+         ! replicated pool and writes the regression dump (same bytes as
+         ! the single-rank in-loop writer above)
+         CALL para_env%sum(ri_data%pari_c3)
+         CALL para_env%max(ri_data%pari_rcond_max)
+         IF (para_env%mepos == para_env%num_pe - 1) THEN
+            OPEN (NEWUNIT=unit_pool, FILE="PARI_POOL_DUMP")
+            DO ipair = 1, npair
+               iatom = pair_i(ipair); jatom = pair_j(ipair); b_img = pair_img(ipair)
+               ni = ri_data%bsizes_RI(iatom)
+               nAOi = ri_data%bsizes_AO(iatom); nAOj = ri_data%bsizes_AO(jatom)
+               ncol = nAOi*nAOj
+               offset = ri_data%pari_c3_offset(ipair) - 1
+               ALLOCATE (c_full(ni, ncol))
+               c_full = RESHAPE(ri_data%pari_c3(offset + 1:offset + ni*ncol), [ni, ncol])
+               WRITE (unit_pool, *) iatom, jatom, b_img, ni, nAOi, nAOj
+               WRITE (unit_pool, '(ES25.16)') c_full
+               DEALLOCATE (c_full)
+            END DO
+            CLOSE (unit_pool)
+         END IF
+      END IF
 
       DEALLOCATE (img_to_mimg, img_cells)
       CALL timestop(handle)
