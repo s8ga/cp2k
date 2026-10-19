@@ -273,14 +273,14 @@ CONTAINS
       CHARACTER(LEN=default_string_length)               :: bsname
       CHARACTER(len=*), PARAMETER                        :: routineN = 'create_pari_aux_basis_set'
 
-      INTEGER :: handle, i, iL, info, ii, iOrbSet, iOrbSh, ipgf, iset, ishell, isgf0, j, &
-                 jOrbSet, jOrbSh, k, kL, la, lb, lmax_orb, ll, Ltot, m, m0, maxL, maxne, &
+      INTEGER :: handle, i, iL, info, ii, iOrbSet, iOrbSh, isgf0, j, jOrbSet, &
+                 jOrbSh, k, kL, la, lb, lmax_orb, Ltot, m, m0, maxL, maxne, &
                  msum, ne, nkeep_tot, nsetF, nsetL, nset_o, nshell_tot, nsoL, ntot
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: kepF, kepL, keep_idx, Llist, ls1, &
                                                             ls1_f, ls2, ls2_f, neL, npgf_b, &
                                                             npgf_f, sh_l, sh_set
       INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: nl_b, nl_f
-      REAL(KIND=dp)                                      :: eval_max, scal, xtmp
+      REAL(KIND=dp)                                      :: eval_max, xtmp
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: evals, rpgf0, sums, work
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: ev_all, exp_all, gpp, gsph, sij, &
                                                             sph, zet_b, zet_f
@@ -528,26 +528,13 @@ CONTAINS
          ri_aux_basis_set => tempered
       END IF
 
-      ! Fold the primitive normalization into the emitted coefficients. The
-      ! generator works with primitives normalized as in the two-center metric
-      ! (2a)^((2l+3)/4), while the integral engine evaluates an in-memory basis
-      ! as contractions of unnormalized primitives divided by the norm_type=2
-      ! factor 2^l (2/pi)^(3/4) a^((2l+3)/4) (this is what the basis reader
-      ! compensates for file bases via init_orb_basis_set). Storing gcc times
-      ! that factor makes the runtime functions the intended (metric-orthogonal)
-      ! set, and the basis-file printer, which divides the factor back out,
-      ! emits exactly these coefficients in file convention.
-      DO iset = 1, ri_aux_basis_set%nset
-         DO ishell = 1, ri_aux_basis_set%nshell(iset)
-            ll = ri_aux_basis_set%l(ishell, iset)
-            scal = 2.0_dp**ll*(2.0_dp/pi)**0.75_dp
-            DO ipgf = 1, ri_aux_basis_set%npgf(iset)
-               ri_aux_basis_set%gcc(ipgf, ishell, iset) = scal* &
-                  ri_aux_basis_set%zet(ipgf, iset)**(0.25_dp*REAL(2*ll + 3, dp))* &
-                  ri_aux_basis_set%gcc(ipgf, ishell, iset)
-            END DO
-         END DO
-      END DO
+      ! Coefficients are emitted in the basis-file convention (contractions of
+      ! normalized primitives): the two-center metric used above for the
+      ! Cholesky/eigendecomposition is exactly the overlap of solid-harmonic
+      ! normalized primitives, and init_orb_basis_set folds the primitive
+      ! normalization into gcc when the basis object is initialised, so the
+      ! runtime basis equals the set constructed here. The basis-file printer
+      ! divides the fold back out when writing the dump.
 
       IF (PRESENT(basis_sort)) THEN
          CALL sort_gto_basis_set(ri_aux_basis_set, basis_sort)
