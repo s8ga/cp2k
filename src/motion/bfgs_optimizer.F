@@ -25,7 +25,6 @@ MODULE bfgs_optimizer
    USE cp_blacs_env,                    ONLY: cp_blacs_env_create,&
                                               cp_blacs_env_release,&
                                               cp_blacs_env_type
-   USE cp_external_control,             ONLY: external_control
    USE cp_files,                        ONLY: close_file,&
                                               open_file
    USE cp_fm_basic_linalg,              ONLY: cp_fm_column_scale,&
@@ -56,13 +55,13 @@ MODULE bfgs_optimizer
    USE force_env_types,                 ONLY: force_env_get,&
                                               force_env_type
    USE global_types,                    ONLY: global_environment_type
+   USE gopt_driver,                     ONLY: &
+        gopt_backend_type, gopt_close_geolog, gopt_io_pred, gopt_io_trust, gopt_open_geolog, &
+        gopt_optimize_loop, gopt_report_nc, gopt_setup_space_group, gopt_show_space_group
    USE gopt_f_methods,                  ONLY: cp_eval_at,&
-                                              gopt_f_ii,&
-                                              gopt_f_io,&
                                               gopt_f_io_finalize,&
                                               gopt_f_io_init,&
-                                              print_geo_opt_header,&
-                                              print_geo_opt_nc
+                                              print_geo_opt_header
    USE gopt_f_types,                    ONLY: gopt_f_type
    USE gopt_param_types,                ONLY: gopt_param_type
    USE ieee_arithmetic,                 ONLY: ieee_is_finite
@@ -72,8 +71,7 @@ MODULE bfgs_optimizer
                                               default_ts_method_id
    USE input_section_types,             ONLY: section_vals_get_subs_vals,&
                                               section_vals_type,&
-                                              section_vals_val_get,&
-                                              section_vals_val_set
+                                              section_vals_val_get
    USE iso_fortran_env,                 ONLY: iostat_end
    USE kinds,                           ONLY: default_path_length,&
                                               dp
@@ -84,9 +82,7 @@ MODULE bfgs_optimizer
    USE message_passing,                 ONLY: mp_para_env_type
    USE parallel_gemm_api,               ONLY: parallel_gemm
    USE particle_list_types,             ONLY: particle_list_type
-   USE space_groups,                    ONLY: identify_space_group,&
-                                              print_spgr,&
-                                              spgr_apply_rotations_coord,&
+   USE space_groups,                    ONLY: spgr_apply_rotations_coord,&
                                               spgr_apply_rotations_force
    USE space_groups_types,              ONLY: spgr_type
 #include "../base/base_uses.f90"
@@ -118,6 +114,28 @@ MODULE bfgs_optimizer
 
    PUBLIC :: bfgs_read_restart_header, geoopt_bfgs
 
+! **************************************************************************************************
+!> \brief BFGS backend state driven by gopt_optimize_loop: matrix workspace,
+!>        restart flags and the accepted-point history.
+! **************************************************************************************************
+   TYPE, EXTENDS(gopt_backend_type) :: bfgs_opt_type
+      PRIVATE
+      INTEGER                                            :: iter_nr = 0, matrix_method = 0, ndf = 0
+      LOGICAL                                            :: hesrest = .FALSE., inverse = .FALSE., &
+                                                            use_mod_hes = .FALSE., use_rfo = .FALSE.
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: dg, dx, eigval, gold, work, xold
+      TYPE(cp_fm_type)                                   :: eigvec_mat, hess_mat, hess_tmp
+      TYPE(cp_fm_struct_type), POINTER                   :: fm_struct_hes => NULL()
+      TYPE(cp_blacs_env_type), POINTER                   :: blacs_env => NULL()
+      TYPE(section_vals_type), POINTER                   :: geo_section => NULL(), print_key => NULL()
+   CONTAINS
+      PROCEDURE, PUBLIC :: finalize => bfgs_finalize
+      PROCEDURE, PUBLIC :: init => bfgs_init
+      PROCEDURE, PUBLIC :: next => bfgs_next
+      PROCEDURE, PUBLIC :: on_stop => bfgs_on_stop
+      PROCEDURE, PUBLIC :: post_step => bfgs_post_step
+   END TYPE bfgs_opt_type
+
 CONTAINS
 
 ! **************************************************************************************************
@@ -141,88 +159,136 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:), POINTER               :: x0
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'geoopt_bfgs'
+
+      INTEGER                                            :: handle, iter_nr, its, output_unit
+      TYPE(bfgs_opt_type)                                :: bfgs
+      TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(cp_subsys_type), POINTER                      :: subsys
+      TYPE(spgr_type), POINTER                           :: spgr
+
+      NULLIFY (logger, subsys, spgr)
+      logger => cp_get_default_logger()
+      spgr => gopt_env%spgr
+      CALL force_env_get(force_env=force_env, subsys=subsys)
+
+      CALL timeset(routineN, handle)
+      CALL gopt_open_geolog(logger, geo_section, output_unit)
+
+      CALL bfgs%init(force_env, gopt_param, globenv, geo_section, gopt_env, x0, output_unit, iter_nr)
+      CALL gopt_optimize_loop(bfgs, force_env, gopt_param, globenv, geo_section, gopt_env, x0, &
+                              gopt_param%max_iter, iter_nr, output_unit, its)
+
+      CALL gopt_report_nc(gopt_env, output_unit, its, gopt_param%max_iter, bfgs%conv)
+
+      ! show space_group
+      CALL gopt_show_space_group(spgr, subsys, geo_section, gopt_env, output_unit)
+
+      CALL bfgs%finalize(force_env, gopt_env, x0, bfgs%conv, its, force_env%root_section, output_unit)
+
+      CALL gopt_close_geolog(output_unit, logger, geo_section)
+      CALL timestop(handle)
+
+   END SUBROUTINE geoopt_bfgs
+
+! **************************************************************************************************
+!> \brief Reads the BFGS keywords, builds the Hessian workspace, restores the
+!>        restart state, sets up the space group and evaluates the start point.
+!> \param backend ...
+!> \param force_env ...
+!> \param gopt_param ...
+!> \param globenv ...
+!> \param geo_section ...
+!> \param gopt_env ...
+!> \param x0 ...
+!> \param output_unit ...
+!> \param iter_nr ...
+! **************************************************************************************************
+   RECURSIVE SUBROUTINE bfgs_init(backend, force_env, gopt_param, globenv, geo_section, gopt_env, &
+                                  x0, output_unit, iter_nr)
+      CLASS(bfgs_opt_type), INTENT(INOUT)                :: backend
+      TYPE(force_env_type), POINTER                      :: force_env
+      TYPE(gopt_param_type), POINTER                     :: gopt_param
+      TYPE(global_environment_type), POINTER             :: globenv
+      TYPE(section_vals_type), POINTER                   :: geo_section
+      TYPE(gopt_f_type), POINTER                         :: gopt_env
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: x0
+      INTEGER, INTENT(IN)                                :: output_unit
+      INTEGER, INTENT(OUT)                               :: iter_nr
+
       REAL(KIND=dp), PARAMETER                           :: one = 1.0_dp, zero = 0.0_dp
 
-      CHARACTER(LEN=5)                                   :: wildcard
-      INTEGER                                            :: handle, info, iter_nr, its, &
-                                                            matrix_method, maxiter, ndf, &
-                                                            output_unit
-      LOGICAL                                            :: conv, hesrest, hess_reset, inverse, &
-                                                            shell_present, should_stop, &
-                                                            use_mod_hes, use_rfo
-      REAL(KIND=dp)                                      :: ediff, emin, eold, etot, pred, rad, rat, &
-                                                            step, t_diff, t_now, t_old
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: dg, dr, dx, eigval, gold, work, xold
-      REAL(KIND=dp), DIMENSION(:), POINTER               :: g
+      INTEGER                                            :: ndf
+      LOGICAL                                            :: shell_present
+      REAL(KIND=dp)                                      :: t_diff, t_now, t_old
       TYPE(atomic_kind_list_type), POINTER               :: atomic_kinds
-      TYPE(cp_blacs_env_type), POINTER                   :: blacs_env
-      TYPE(cp_fm_struct_type), POINTER                   :: fm_struct_hes
-      TYPE(cp_fm_type)                                   :: eigvec_mat, hess_mat, hess_tmp
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(cp_subsys_type), POINTER                      :: subsys
       TYPE(mp_para_env_type), POINTER                    :: para_env
-      TYPE(section_vals_type), POINTER                   :: print_key, root_section
       TYPE(spgr_type), POINTER                           :: spgr
 
-      NULLIFY (logger, g, blacs_env, spgr)
+      MARK_USED(gopt_param)
+
+      NULLIFY (logger, subsys, spgr)
       logger => cp_get_default_logger()
       para_env => force_env%para_env
-      root_section => force_env%root_section
       spgr => gopt_env%spgr
+      CALL force_env_get(force_env=force_env, subsys=subsys)
       t_old = m_walltime()
 
-      CALL timeset(routineN, handle)
-      CALL section_vals_val_get(geo_section, "BFGS%TRUST_RADIUS", r_val=rad)
-      print_key => section_vals_get_subs_vals(geo_section, "BFGS%RESTART")
-      CALL section_vals_val_get(geo_section, "BFGS%METHOD", i_val=matrix_method)
-      inverse = matrix_method == bfgs_inverse
-      maxiter = gopt_param%max_iter
-      conv = .FALSE.
-      rat = 0.0_dp
-      wildcard = " BFGS"
+      CALL section_vals_val_get(geo_section, "BFGS%TRUST_RADIUS", r_val=backend%rad)
+      backend%print_key => section_vals_get_subs_vals(geo_section, "BFGS%RESTART")
+      CALL section_vals_val_get(geo_section, "BFGS%METHOD", i_val=backend%matrix_method)
+      backend%inverse = backend%matrix_method == bfgs_inverse
+      backend%conv = .FALSE.
+      backend%rat = 0.0_dp
+      backend%wildcard = " BFGS"
+      backend%output_unit = output_unit
+      backend%ndf = SIZE(x0)
+      backend%geo_section => geo_section
 
-      ! Stop if not yet implemented
-      SELECT CASE (gopt_env%type_id)
-      CASE (default_ts_method_id)
+      IF (gopt_env%type_id == default_ts_method_id) THEN
          CPABORT("BFGS method not yet working with DIMER")
-      END SELECT
+      END IF
 
-      CALL section_vals_val_get(geo_section, "BFGS%USE_RAT_FUN_OPT", l_val=use_rfo)
-      CALL section_vals_val_get(geo_section, "BFGS%USE_MODEL_HESSIAN", l_val=use_mod_hes)
-      CALL section_vals_val_get(geo_section, "BFGS%RESTART_HESSIAN", l_val=hesrest)
-      IF (inverse .AND. use_rfo) THEN
+      CALL section_vals_val_get(geo_section, "BFGS%USE_RAT_FUN_OPT", l_val=backend%use_rfo)
+      CALL section_vals_val_get(geo_section, "BFGS%USE_MODEL_HESSIAN", l_val=backend%use_mod_hes)
+      CALL section_vals_val_get(geo_section, "BFGS%RESTART_HESSIAN", l_val=backend%hesrest)
+      IF (backend%inverse) THEN
+         backend%io_variant = gopt_io_trust
+      ELSE
+         backend%io_variant = gopt_io_pred
+      END IF
+      IF (backend%inverse .AND. backend%use_rfo) THEN
          CALL cp_abort(__LOCATION__, &
                        "BFGS METHOD INVERSE does not support USE_RAT_FUN_OPT")
       END IF
-      IF (inverse) THEN
-         IF (.NOT. ieee_is_finite(rad) .OR. rad <= 0.0_dp) THEN
+      IF (backend%inverse) THEN
+         IF (.NOT. ieee_is_finite(backend%rad) .OR. backend%rad <= 0.0_dp) THEN
             CALL cp_abort(__LOCATION__, &
                           "BFGS TRUST_RADIUS must be finite and positive")
          END IF
       END IF
-      output_unit = cp_print_key_unit_nr(logger, geo_section, "PRINT%PROGRAM_RUN_INFO", &
-                                         extension=".geoLog")
       IF (output_unit > 0) THEN
-         IF (inverse) THEN
+         IF (backend%inverse) THEN
             WRITE (UNIT=output_unit, FMT="(/,T2,A)") "BFGS| Matrix update method: INVERSE"
          ELSE
             WRITE (UNIT=output_unit, FMT="(/,T2,A)") "BFGS| Matrix update method: DIRECT"
          END IF
-         IF (use_rfo) THEN
+         IF (backend%use_rfo) THEN
             WRITE (UNIT=output_unit, FMT="(/,T2,A,T78,A3)") &
                "BFGS| Use rational function optimization for step estimation: ", "YES"
          ELSE
             WRITE (UNIT=output_unit, FMT="(/,T2,A,T78,A3)") &
                "BFGS| Use rational function optimization for step estimation: ", " NO"
          END IF
-         IF (use_mod_hes) THEN
+         IF (backend%use_mod_hes) THEN
             WRITE (UNIT=output_unit, FMT="(T2,A,T78,A3)") &
                "BFGS| Use model Hessian for initial guess: ", "YES"
          ELSE
             WRITE (UNIT=output_unit, FMT="(T2,A,T78,A3)") &
                "BFGS| Use model Hessian for initial guess: ", " NO"
          END IF
-         IF (hesrest) THEN
+         IF (backend%hesrest) THEN
             WRITE (UNIT=output_unit, FMT="(T2,A,T78,A3)") &
                "BFGS| Restart Hessian: ", "YES"
          ELSE
@@ -230,11 +296,11 @@ CONTAINS
                "BFGS| Restart Hessian: ", " NO"
          END IF
          WRITE (UNIT=output_unit, FMT="(T2,A,T61,F20.3)") &
-            "BFGS| Trust radius: ", rad
+            "BFGS| Trust radius: ", backend%rad
       END IF
 
-      ndf = SIZE(x0)
-      IF (ndf > 3000 .AND. .NOT. inverse) THEN
+      ndf = backend%ndf
+      IF (ndf > 3000 .AND. .NOT. backend%inverse) THEN
          CALL cp_warn(__LOCATION__, &
                       "The dimension of the Hessian matrix ("// &
                       TRIM(ADJUSTL(cp_to_string(ndf)))//") is greater than 3000. "// &
@@ -244,292 +310,349 @@ CONTAINS
       END IF
 
       ! Initialize hessian (hes = unitary matrix or model hessian )
-      CALL cp_blacs_env_create(blacs_env, para_env, globenv%blacs_grid_layout, &
+      CALL cp_blacs_env_create(backend%blacs_env, para_env, globenv%blacs_grid_layout, &
                                globenv%blacs_repeatable)
-      CALL cp_fm_struct_create(fm_struct_hes, para_env=para_env, context=blacs_env, &
+      CALL cp_fm_struct_create(backend%fm_struct_hes, para_env=para_env, context=backend%blacs_env, &
                                nrow_global=ndf, ncol_global=ndf)
-      CALL cp_fm_create(hess_mat, fm_struct_hes, name="hess_mat")
+      CALL cp_fm_create(backend%hess_mat, backend%fm_struct_hes, name="hess_mat")
 
-      CALL force_env_get(force_env=force_env, subsys=subsys)
       CALL cp_subsys_get(subsys, atomic_kinds=atomic_kinds)
       CALL get_atomic_kind_set(atomic_kind_set=atomic_kinds%els, shell_present=shell_present)
-      IF (use_mod_hes) THEN
+      IF (backend%use_mod_hes) THEN
          IF (shell_present) THEN
             CALL cp_warn(__LOCATION__, &
                          "No model Hessian is available for core-shell models. "// &
                          "A unit matrix is used as the initial Hessian.")
-            use_mod_hes = .FALSE.
+            backend%use_mod_hes = .FALSE.
          END IF
          IF (gopt_env%type_id == default_cell_method_id) THEN
             CALL cp_warn(__LOCATION__, &
                          "No model Hessian is available for cell optimizations. "// &
                          "A unit matrix is used as the initial Hessian.")
-            use_mod_hes = .FALSE.
+            backend%use_mod_hes = .FALSE.
          END IF
       END IF
 
       ! hess_mat stores B for DIRECT and H = B^{-1} for INVERSE.
       ! DIRECT keeps the spectral work arrays for step construction; INVERSE
       ! only needs them while building a model-Hessian initial guess.
-      IF (.NOT. inverse .OR. (use_mod_hes .AND. .NOT. hesrest)) THEN
-         CALL cp_fm_create(hess_tmp, fm_struct_hes, name="hess_tmp")
-         CALL cp_fm_create(eigvec_mat, fm_struct_hes, name="eigvec_mat")
-         ALLOCATE (eigval(ndf))
-         eigval(:) = zero
+      IF (.NOT. backend%inverse .OR. (backend%use_mod_hes .AND. .NOT. backend%hesrest)) THEN
+         CALL cp_fm_create(backend%hess_tmp, backend%fm_struct_hes, name="hess_tmp")
+         CALL cp_fm_create(backend%eigvec_mat, backend%fm_struct_hes, name="eigvec_mat")
+         ALLOCATE (backend%eigval(ndf))
+         backend%eigval(:) = zero
       END IF
 
-      IF (inverse) THEN
-         IF (use_mod_hes .AND. .NOT. hesrest) THEN
-            CALL build_initial_hess(hess_mat, hess_tmp, eigvec_mat, eigval, force_env, &
-                                    use_mod_hes, .TRUE.)
+      IF (backend%inverse) THEN
+         IF (backend%use_mod_hes .AND. .NOT. backend%hesrest) THEN
+            CALL build_initial_hess(backend%hess_mat, backend%hess_tmp, backend%eigvec_mat, backend%eigval, force_env, &
+                                    backend%use_mod_hes, .TRUE.)
          ELSE
-            CALL cp_fm_set_all(hess_mat, alpha=zero, beta=one)
+            CALL cp_fm_set_all(backend%hess_mat, alpha=zero, beta=one)
          END IF
       ELSE
-         CALL build_initial_hess(hess_mat, hess_tmp, eigvec_mat, eigval, force_env, &
-                                 use_mod_hes, .FALSE.)
+         CALL build_initial_hess(backend%hess_mat, backend%hess_tmp, backend%eigvec_mat, backend%eigval, force_env, &
+                                 backend%use_mod_hes, .FALSE.)
       END IF
 
-      IF (inverse .AND. ALLOCATED(eigval)) THEN
-         CALL cp_fm_release(eigvec_mat)
-         CALL cp_fm_release(hess_tmp)
-         DEALLOCATE (eigval)
+      IF (backend%inverse .AND. ALLOCATED(backend%eigval)) THEN
+         CALL cp_fm_release(backend%eigvec_mat)
+         CALL cp_fm_release(backend%hess_tmp)
+         DEALLOCATE (backend%eigval)
       END IF
 
       ! Restore the reference coordinates before symmetry setup and the first evaluation.
-      IF (hesrest) CALL read_bfgs_hessian(geo_section, hess_mat, logger, gopt_env, x0, matrix_method)
+      IF (backend%hesrest) CALL read_bfgs_hessian(geo_section, backend%hess_mat, logger, gopt_env, x0, backend%matrix_method)
 
-      ALLOCATE (xold(ndf))
-      xold(:) = x0(:)
+      ALLOCATE (backend%xold(ndf))
+      backend%xold(:) = x0(:)
 
-      ALLOCATE (g(ndf))
-      g(:) = 0.0_dp
+      ALLOCATE (backend%g(ndf))
+      backend%g(:) = 0.0_dp
 
-      ALLOCATE (gold(ndf))
-      gold(:) = 0.0_dp
+      ALLOCATE (backend%gold(ndf))
+      backend%gold(:) = 0.0_dp
 
-      ALLOCATE (dx(ndf))
-      dx(:) = 0.0_dp
+      ALLOCATE (backend%dx(ndf))
+      backend%dx(:) = 0.0_dp
 
-      ALLOCATE (dg(ndf))
-      dg(:) = 0.0_dp
+      ALLOCATE (backend%dg(ndf))
+      backend%dg(:) = 0.0_dp
 
-      ALLOCATE (work(ndf))
-      work(:) = 0.0_dp
+      ALLOCATE (backend%work(ndf))
+      backend%work(:) = 0.0_dp
 
-      ALLOCATE (dr(ndf))
-      dr(:) = 0.0_dp
+      ALLOCATE (backend%dr(ndf))
+      backend%dr(:) = 0.0_dp
 
       ! find space_group
-      IF (spgr%keep_space_group) THEN
-         CALL identify_space_group(subsys, geo_section, gopt_env, output_unit)
-         CALL spgr_apply_rotations_coord(spgr, x0)
-         CALL print_spgr(spgr)
-      END IF
+      CALL gopt_setup_space_group(spgr, subsys, geo_section, gopt_env, x0, output_unit)
 
       ! Geometry optimization starts now
       CALL cp_iterate(logger%iter_info, increment=0, iter_nr_out=iter_nr)
-      CALL print_geo_opt_header(gopt_env, output_unit, wildcard)
+      backend%iter_nr = iter_nr
+      CALL print_geo_opt_header(gopt_env, output_unit, backend%wildcard)
 
       ! Calculate Energy & Gradients
-      CALL cp_eval_at(gopt_env, x0, etot, g, master=gopt_env%force_env%para_env%mepos, &
+      CALL cp_eval_at(gopt_env, x0, backend%etot, backend%g, master=gopt_env%force_env%para_env%mepos, &
                       para_env=gopt_env%force_env%para_env)
 
       ! Symmetrize coordinates and forces
       IF (spgr%keep_space_group) THEN
          CALL spgr_apply_rotations_coord(spgr, x0)
-         CALL spgr_apply_rotations_force(spgr, g)
+         CALL spgr_apply_rotations_force(spgr, backend%g)
       END IF
 
       ! Print info at time 0
-      emin = etot
+      backend%emin = backend%etot
+      backend%eold = backend%etot
       t_now = m_walltime()
       t_diff = t_now - t_old
-      t_old = t_now
-      CALL gopt_f_io_init(gopt_env, output_unit, etot, wildcard=wildcard, its=iter_nr, used_time=t_diff)
-      DO its = iter_nr + 1, maxiter
-         CALL cp_iterate(logger%iter_info, last=(its == maxiter))
-         CALL section_vals_val_set(geo_section, "STEP_START_VAL", i_val=its)
-         CALL gopt_f_ii(its, output_unit)
+      CALL gopt_f_io_init(gopt_env, output_unit, backend%etot, wildcard=backend%wildcard, its=iter_nr, used_time=t_diff)
 
-         IF ((its - iter_nr) > 1) THEN
-            ! Symmetrize old coordinates and old forces.
-            IF (spgr%keep_space_group) THEN
-               CALL spgr_apply_rotations_coord(spgr, xold)
-               CALL spgr_apply_rotations_force(spgr, gold)
-            END IF
+   END SUBROUTINE bfgs_init
 
-            ! cp_eval_at may project the proposed geometry: use the actual displacement.
-            dx(:) = x0(:) - xold(:)
-            dg(:) = g(:) - gold(:)
-            IF (inverse) THEN
-               CALL bfgs_inverse_update(ndf, dx, dg, hess_mat, work)
-            ELSE
-               CALL bfgs(ndf, dx, dg, hess_mat, work, para_env, output_unit, hess_reset)
-               IF (hess_reset) THEN
-                  CALL build_initial_hess(hess_mat, hess_tmp, eigvec_mat, eigval, force_env, &
-                                          use_mod_hes, .FALSE.)
-               END IF
-            END IF
+! **************************************************************************************************
+!> \brief Builds the BFGS step from the current point, applies it and evaluates
+!>        the accepted point, filling the shared observables.
+!> \param backend ...
+!> \param its ...
+!> \param force_env ...
+!> \param gopt_param ...
+!> \param globenv ...
+!> \param geo_section ...
+!> \param gopt_env ...
+!> \param x0 ...
+!> \return ...
+! **************************************************************************************************
+   RECURSIVE FUNCTION bfgs_next(backend, its, force_env, gopt_param, globenv, geo_section, gopt_env, x0) RESULT(keep)
+      CLASS(bfgs_opt_type), INTENT(INOUT)                :: backend
+      INTEGER, INTENT(IN)                                :: its
+      TYPE(force_env_type), POINTER                      :: force_env
+      TYPE(gopt_param_type), POINTER                     :: gopt_param
+      TYPE(global_environment_type), POINTER             :: globenv
+      TYPE(section_vals_type), POINTER                   :: geo_section
+      TYPE(gopt_f_type), POINTER                         :: gopt_env
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: x0
+      LOGICAL                                            :: keep
 
-            IF (spgr%keep_space_group) THEN
-               CALL spgr_apply_rotations_force(spgr, dx)
-               CALL spgr_apply_rotations_force(spgr, dg)
-            END IF
+      REAL(KIND=dp), PARAMETER                           :: one = 1.0_dp, zero = 0.0_dp
 
-            IF (BTEST(cp_print_key_should_output(logger%iter_info, print_key), cp_p_file)) THEN
-               CALL write_bfgs_hessian(geo_section, hess_mat, logger, gopt_env, matrix_method)
-            END IF
-         END IF
+      INTEGER                                            :: info, ndf
+      LOGICAL                                            :: hess_reset
+      TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(mp_para_env_type), POINTER                    :: para_env
+      TYPE(spgr_type), POINTER                           :: spgr
 
-         ! Symmetrize coordinates and forces
+      MARK_USED(globenv)
+      MARK_USED(gopt_param)
+
+      NULLIFY (logger, spgr)
+      logger => cp_get_default_logger()
+      para_env => force_env%para_env
+      spgr => gopt_env%spgr
+      ndf = backend%ndf
+
+      IF ((its - backend%iter_nr) > 1) THEN
+         ! Symmetrize old coordinates and old forces.
          IF (spgr%keep_space_group) THEN
-            CALL spgr_apply_rotations_coord(spgr, x0)
-            CALL spgr_apply_rotations_force(spgr, g)
+            CALL spgr_apply_rotations_coord(spgr, backend%xold)
+            CALL spgr_apply_rotations_force(spgr, backend%gold)
          END IF
 
-         ! Setting the present positions & gradients as old
-         xold(:) = x0
-         gold(:) = g
-
-         IF (inverse) THEN
-            CALL bfgs_inverse_step(hess_mat, g, dr)
+         ! cp_eval_at may project the proposed geometry: use the actual displacement.
+         backend%dx(:) = x0(:) - backend%xold(:)
+         backend%dg(:) = backend%g(:) - backend%gold(:)
+         IF (backend%inverse) THEN
+            CALL bfgs_inverse_update(ndf, backend%dx, backend%dg, backend%hess_mat, backend%work)
          ELSE
-            ! Copying hessian hes to (ndf x ndf) matrix hes_mat for diagonalization
-            CALL cp_fm_to_fm(hess_mat, hess_tmp)
-
-            CALL choose_eigv_solver(hess_tmp, eigvec_mat, eigval, info=info)
-
-            ! In rare cases the diagonalization of hess_mat fails (bug in scalapack?)
-            IF (info /= 0) THEN
-               IF (output_unit > 0) THEN
-                  WRITE (output_unit, *) &
-                     "BFGS: Matrix diagonalization failed, resetting Hessian to unity."
-               END IF
-               CALL cp_fm_set_all(hess_mat, alpha=zero, beta=one)
-               CALL cp_fm_to_fm(hess_mat, hess_tmp)
-               CALL choose_eigv_solver(hess_tmp, eigvec_mat, eigval)
+            CALL bfgs(ndf, backend%dx, backend%dg, backend%hess_mat, backend%work, para_env, backend%output_unit, hess_reset)
+            IF (hess_reset) THEN
+               CALL build_initial_hess(backend%hess_mat, backend%hess_tmp, backend%eigvec_mat, backend%eigval, force_env, &
+                                       backend%use_mod_hes, .FALSE.)
             END IF
-
-            IF (use_rfo) THEN
-               CALL set_hes_eig(ndf, eigval, work)
-               dx(:) = eigval
-               CALL rat_fun_opt(ndf, dg, eigval, work, eigvec_mat, g, para_env)
-            END IF
-            CALL geoopt_get_step(ndf, eigval, eigvec_mat, hess_tmp, dr, g, para_env, use_rfo)
-
-         END IF
-         IF (gopt_env%type_id == default_cell_method_id) THEN
-            CALL bfgs_project_cell_step(gopt_env, dr)
          END IF
 
-         ! Symmetrize dr
          IF (spgr%keep_space_group) THEN
-            CALL spgr_apply_rotations_force(spgr, dr)
+            CALL spgr_apply_rotations_force(spgr, backend%dx)
+            CALL spgr_apply_rotations_force(spgr, backend%dg)
          END IF
 
-         IF (inverse) THEN
-            ! Avoid a zero-step division and initialize the reported scale on every step.
-            rat = 1.0_dp
-            step = MAXVAL(ABS(dr))
-            IF (step > rad) THEN
-               rat = rad/step
-               dr(:) = rat*dr(:)
-               step = rad
-            END IF
-         ELSE
-            CALL trust_radius(ndf, step, rad, rat, dr, output_unit)
+         IF (BTEST(cp_print_key_should_output(logger%iter_info, backend%print_key), cp_p_file)) THEN
+            CALL write_bfgs_hessian(geo_section, backend%hess_mat, logger, gopt_env, backend%matrix_method)
          END IF
-
-         ! Update the atomic positions
-         x0 = x0 + dr
-
-         ! Symmetrize coordinates
-         IF (spgr%keep_space_group) THEN
-            CALL spgr_apply_rotations_coord(spgr, x0)
-         END IF
-
-         eold = etot
-
-         ! Energy & Gradients at new step
-         CALL cp_eval_at(gopt_env, x0, etot, g, master=gopt_env%force_env%para_env%mepos, &
-                         para_env=gopt_env%force_env%para_env)
-
-         ! Use the displacement actually accepted by constraints and cell projection.
-         dr(:) = x0(:) - xold(:)
-         step = MAXVAL(ABS(dr))
-
-         ! This diagnostic requires B, not H. It is optional in gopt_f_io.
-         IF (.NOT. inverse) CALL energy_predict(ndf, work, hess_mat, dr, gold, pred, para_env)
-
-         ediff = etot - eold
-
-         ! Symmetrize forces
-         IF (spgr%keep_space_group) THEN
-            CALL spgr_apply_rotations_force(spgr, g)
-         END IF
-
-         ! check for an external exit command
-         CALL external_control(should_stop, "GEO", globenv=globenv)
-         IF (should_stop) EXIT
-
-         ! Some IO and Convergence check
-         t_now = m_walltime()
-         t_diff = t_now - t_old
-         t_old = t_now
-         IF (inverse) THEN
-            CALL gopt_f_io(gopt_env, force_env, root_section, its, etot, output_unit, &
-                           eold, emin, wildcard, gopt_param, ndf, dr, g, conv, &
-                           rat=rat, step=step, rad=rad, used_time=t_diff)
-         ELSE
-            CALL gopt_f_io(gopt_env, force_env, root_section, its, etot, output_unit, &
-                           eold, emin, wildcard, gopt_param, ndf, dr, g, conv, pred, rat, &
-                           step, rad, used_time=t_diff)
-         END IF
-
-         IF (conv .OR. (its == maxiter)) EXIT
-         IF (etot < emin) emin = etot
-         IF (use_rfo) CALL update_trust_rad(rat, rad, step, ediff)
-      END DO
-
-      IF (its == maxiter .AND. (.NOT. conv)) THEN
-         CALL print_geo_opt_nc(gopt_env, output_unit)
       END IF
 
-      ! show space_group
-      IF (spgr%show_space_group) THEN
-         CALL identify_space_group(subsys, geo_section, gopt_env, output_unit)
-         CALL print_spgr(spgr)
+      ! Symmetrize coordinates and forces
+      IF (spgr%keep_space_group) THEN
+         CALL spgr_apply_rotations_coord(spgr, x0)
+         CALL spgr_apply_rotations_force(spgr, backend%g)
       END IF
+
+      ! Setting the present positions & gradients as old
+      backend%xold(:) = x0
+      backend%gold(:) = backend%g
+
+      IF (backend%inverse) THEN
+         CALL bfgs_inverse_step(backend%hess_mat, backend%g, backend%dr)
+      ELSE
+         ! Copying hessian hes to (ndf x ndf) matrix hes_mat for diagonalization
+         CALL cp_fm_to_fm(backend%hess_mat, backend%hess_tmp)
+
+         CALL choose_eigv_solver(backend%hess_tmp, backend%eigvec_mat, backend%eigval, info=info)
+
+         ! In rare cases the diagonalization of hess_mat fails (bug in scalapack?)
+         IF (info /= 0) THEN
+            IF (backend%output_unit > 0) THEN
+               WRITE (backend%output_unit, *) &
+                  "BFGS: Matrix diagonalization failed, resetting Hessian to unity."
+            END IF
+            CALL cp_fm_set_all(backend%hess_mat, alpha=zero, beta=one)
+            CALL cp_fm_to_fm(backend%hess_mat, backend%hess_tmp)
+            CALL choose_eigv_solver(backend%hess_tmp, backend%eigvec_mat, backend%eigval)
+         END IF
+
+         IF (backend%use_rfo) THEN
+            CALL set_hes_eig(ndf, backend%eigval, backend%work)
+            backend%dx(:) = backend%eigval
+            CALL rat_fun_opt(ndf, backend%dg, backend%eigval, backend%work, backend%eigvec_mat, backend%g, para_env)
+         END IF
+         CALL geoopt_get_step(ndf, backend%eigval, backend%eigvec_mat, backend%hess_tmp, backend%dr, backend%g, &
+                              para_env, backend%use_rfo)
+
+      END IF
+      IF (gopt_env%type_id == default_cell_method_id) THEN
+         CALL bfgs_project_cell_step(gopt_env, backend%dr)
+      END IF
+
+      ! Symmetrize dr
+      IF (spgr%keep_space_group) THEN
+         CALL spgr_apply_rotations_force(spgr, backend%dr)
+      END IF
+
+      IF (backend%inverse) THEN
+         ! Avoid a zero-step division and initialize the reported scale on every step.
+         backend%rat = 1.0_dp
+         backend%step = MAXVAL(ABS(backend%dr))
+         IF (backend%step > backend%rad) THEN
+            backend%rat = backend%rad/backend%step
+            backend%dr(:) = backend%rat*backend%dr(:)
+            backend%step = backend%rad
+         END IF
+      ELSE
+         CALL trust_radius(ndf, backend%step, backend%rad, backend%rat, backend%dr, backend%output_unit)
+      END IF
+
+      ! Update the atomic positions
+      x0 = x0 + backend%dr
+
+      ! Symmetrize coordinates
+      IF (spgr%keep_space_group) THEN
+         CALL spgr_apply_rotations_coord(spgr, x0)
+      END IF
+
+      ! Energy & Gradients at new step
+      CALL cp_eval_at(gopt_env, x0, backend%etot, backend%g, master=gopt_env%force_env%para_env%mepos, &
+                      para_env=gopt_env%force_env%para_env)
+
+      ! Use the displacement actually accepted by constraints and cell projection.
+      backend%dr(:) = x0(:) - backend%xold(:)
+      backend%step = MAXVAL(ABS(backend%dr))
+
+      ! This diagnostic requires B, not H. It is optional in gopt_f_io.
+      IF (.NOT. backend%inverse) CALL energy_predict(ndf, backend%work, backend%hess_mat, backend%dr, &
+                                                     backend%gold, backend%pred, para_env)
+
+      backend%ediff = backend%etot - backend%eold
+
+      ! Symmetrize forces
+      IF (spgr%keep_space_group) THEN
+         CALL spgr_apply_rotations_force(spgr, backend%g)
+      END IF
+
+      keep = .TRUE.
+
+   END FUNCTION bfgs_next
+
+! **************************************************************************************************
+!> \brief RFO trust-radius update after a reported step (emin/eold are shared
+!>        loop bookkeeping).
+!> \param backend ...
+!> \param its ...
+! **************************************************************************************************
+   SUBROUTINE bfgs_post_step(backend, its)
+      CLASS(bfgs_opt_type), INTENT(INOUT)                :: backend
+      INTEGER, INTENT(IN)                                :: its
+
+      MARK_USED(its)
+
+      IF (backend%use_rfo) CALL update_trust_rad(backend%rat, backend%rad, backend%step, backend%ediff)
+
+   END SUBROUTINE bfgs_post_step
+
+! **************************************************************************************************
+!> \brief Nothing to stop for BFGS on an external exit request.
+!> \param backend ...
+! **************************************************************************************************
+   SUBROUTINE bfgs_on_stop(backend)
+      CLASS(bfgs_opt_type), INTENT(INOUT)                :: backend
+
+      MARK_USED(backend)
+
+   END SUBROUTINE bfgs_on_stop
+
+! **************************************************************************************************
+!> \brief Writes the final information and the Hessian restart file, then
+!>        releases the backend workspace.
+!> \param backend ...
+!> \param force_env ...
+!> \param gopt_env ...
+!> \param x0 ...
+!> \param conv ...
+!> \param its ...
+!> \param root_section ...
+!> \param output_unit ...
+! **************************************************************************************************
+   RECURSIVE SUBROUTINE bfgs_finalize(backend, force_env, gopt_env, x0, conv, its, root_section, &
+                                      output_unit)
+      CLASS(bfgs_opt_type), INTENT(INOUT)                :: backend
+      TYPE(force_env_type), POINTER                      :: force_env
+      TYPE(gopt_f_type), POINTER                         :: gopt_env
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: x0
+      LOGICAL, INTENT(IN)                                :: conv
+      INTEGER, INTENT(IN)                                :: its
+      TYPE(section_vals_type), POINTER                   :: root_section
+      INTEGER, INTENT(IN)                                :: output_unit
+
+      TYPE(cp_logger_type), POINTER                      :: logger
+
+      NULLIFY (logger)
+      logger => cp_get_default_logger()
 
       ! Write final  information, if converged
       CALL cp_iterate(logger%iter_info, last=.TRUE., increment=0)
-      CALL write_bfgs_hessian(geo_section, hess_mat, logger, gopt_env, matrix_method)
+      CALL write_bfgs_hessian(backend%geo_section, backend%hess_mat, logger, gopt_env, backend%matrix_method)
       CALL gopt_f_io_finalize(gopt_env, force_env, x0, conv, its, root_section, &
                               gopt_env%force_env%para_env, gopt_env%force_env%para_env%mepos, output_unit)
 
-      CALL cp_fm_struct_release(fm_struct_hes)
-      CALL cp_fm_release(hess_mat)
-      IF (.NOT. inverse) THEN
-         CALL cp_fm_release(eigvec_mat)
-         CALL cp_fm_release(hess_tmp)
+      CALL cp_fm_struct_release(backend%fm_struct_hes)
+      CALL cp_fm_release(backend%hess_mat)
+      IF (.NOT. backend%inverse) THEN
+         CALL cp_fm_release(backend%eigvec_mat)
+         CALL cp_fm_release(backend%hess_tmp)
       END IF
 
-      CALL cp_blacs_env_release(blacs_env)
-      DEALLOCATE (xold)
-      DEALLOCATE (g)
-      DEALLOCATE (gold)
-      DEALLOCATE (dx)
-      DEALLOCATE (dg)
-      IF (ALLOCATED(eigval)) DEALLOCATE (eigval)
-      DEALLOCATE (work)
-      DEALLOCATE (dr)
+      CALL cp_blacs_env_release(backend%blacs_env)
+      DEALLOCATE (backend%xold)
+      DEALLOCATE (backend%g)
+      DEALLOCATE (backend%gold)
+      DEALLOCATE (backend%dx)
+      DEALLOCATE (backend%dg)
+      IF (ALLOCATED(backend%eigval)) DEALLOCATE (backend%eigval)
+      DEALLOCATE (backend%work)
+      DEALLOCATE (backend%dr)
 
-      CALL cp_print_key_finished_output(output_unit, logger, geo_section, &
-                                        "PRINT%PROGRAM_RUN_INFO")
-      CALL timestop(handle)
-
-   END SUBROUTINE geoopt_bfgs
+   END SUBROUTINE bfgs_finalize
 
 ! **************************************************************************************************
 !> \brief Damped inverse-BFGS update, using only a matvec and local rank-two updates.
