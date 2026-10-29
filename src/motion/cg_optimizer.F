@@ -12,6 +12,9 @@
 ! **************************************************************************************************
 MODULE cg_optimizer
 
+   USE cell_manifold_utils,             ONLY: cell_manifold_expand_step,&
+                                              cell_manifold_project_grad,&
+                                              n_slot
    USE cell_types,                      ONLY: cell_type
    USE cg_utils,                        ONLY: cg_linmin,&
                                               get_conjugate_direction
@@ -30,6 +33,7 @@ MODULE cg_optimizer
                                               gopt_f_io,&
                                               gopt_f_io_finalize,&
                                               gopt_f_io_init,&
+                                              gopt_f_setup_space_group,&
                                               print_geo_opt_header,&
                                               print_geo_opt_nc
    USE gopt_f_types,                    ONLY: gopt_f_type
@@ -104,9 +108,7 @@ CONTAINS
          SELECT CASE (gopt_env%type_id)
          CASE (default_minimization_method_id, default_ts_method_id, default_cell_method_id)
             CALL force_env_get(force_env, subsys=subsys)
-            CALL identify_space_group(subsys, geo_section, gopt_env, output_unit)
-            CALL spgr_apply_rotations_coord(spgr, x0)
-            CALL print_spgr(spgr)
+            CALL gopt_f_setup_space_group(spgr, subsys, geo_section, gopt_env, x0, output_unit)
          CASE DEFAULT
             spgr%keep_space_group = .FALSE.
          END SELECT
@@ -159,13 +161,14 @@ CONTAINS
 
       CHARACTER(LEN=5)                                   :: wildcard
       INTEGER                                            :: handle, iter_nr, its, max_steep_steps, &
-                                                            maxiter
+                                                            maxiter, nsize
       LOGICAL                                            :: conv, evaluate_before_io, &
                                                             Fletcher_Reeves, &
                                                             save_consistent_energy_force, &
                                                             should_stop
-      REAL(KIND=dp)                                      :: emin, eold, opt_energy, res_lim, t_diff, &
-                                                            t_now, t_old
+      REAL(KIND=dp)                                      :: emin, eold, h_cell(n_slot), &
+                                                            h_red(n_slot), opt_energy, res_lim, &
+                                                            t_diff, t_now, t_old
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: xold
       REAL(KIND=dp), DIMENSION(:), POINTER               :: g, h, xi
       TYPE(cell_type), POINTER                           :: cell
@@ -275,6 +278,23 @@ CONTAINS
          ! Get Conjugate Directions:  updates the searching direction (h)
          wildcard = "   CG"
          CALL get_conjugate_direction(gopt_env, Fletcher_Reeves, g, xi, h)
+
+         IF (gopt_env%type_id == default_cell_method_id) THEN
+            ! Slot pins and linear rows keep the tangent space constant, so
+            ! projected gradients combine into projected directions. Geometric
+            ! and equality rows move the tangent space with the cell, so the
+            ! conjugate direction needs a fresh projection.
+            IF (gopt_env%cell_env%manifold%n_geom_rows > 0 .OR. &
+                gopt_env%cell_env%manifold%n_eq_rows > 0) THEN
+               nsize = SIZE(h) - n_slot
+               h_cell = h(nsize + 1:nsize + n_slot)
+               CALL cell_manifold_project_grad(gopt_env%cell_env%manifold, h_cell, &
+                                               h_red(1:gopt_env%cell_env%manifold%ndof))
+               CALL cell_manifold_expand_step(gopt_env%cell_env%manifold, &
+                                              h_red(1:gopt_env%cell_env%manifold%ndof), &
+                                              h(nsize + 1:nsize + n_slot))
+            END IF
+         END IF
 
          ! Symmetrize coordinates and forces
          IF (spgr%keep_space_group) THEN

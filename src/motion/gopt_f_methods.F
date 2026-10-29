@@ -18,12 +18,21 @@ MODULE gopt_f_methods
                                               get_atomic_kind_set
    USE bibliography,                    ONLY: Henkelman1999,&
                                               cite_reference
+   USE cell_manifold_utils,             ONLY: cell_manifold_expand_step,&
+                                              cell_manifold_proj_pressure,&
+                                              cell_manifold_project_grad,&
+                                              cell_manifold_retract,&
+                                              cell_manifold_update_basis,&
+                                              info_ok,&
+                                              n_slot
    USE cell_methods,                    ONLY: cell_create,&
                                               init_cell,&
                                               write_cell
+   USE cell_opt_types,                  ONLY: cell_opt_fold_symmetry_rows,&
+                                              cell_opt_setup_manifold
    USE cell_opt_utils,                  ONLY: cell_opt_constraint_label,&
                                               get_dg_dh,&
-                                              rescale_new_cell_volume
+                                              spgr_point_group_symmetry_id
    USE cell_types,                      ONLY: cell_copy,&
                                               cell_release,&
                                               cell_type,&
@@ -52,8 +61,7 @@ MODULE gopt_f_methods
    USE input_constants,                 ONLY: default_cell_method_id,&
                                               default_minimization_method_id,&
                                               default_shellcore_method_id,&
-                                              default_ts_method_id,&
-                                              fix_none
+                                              default_ts_method_id
    USE input_cp2k_restarts,             ONLY: write_restart
    USE input_section_types,             ONLY: section_vals_type,&
                                               section_vals_val_get
@@ -72,7 +80,10 @@ MODULE gopt_f_methods
    USE particle_types,                  ONLY: particle_type
    USE qmmm_util,                       ONLY: apply_qmmm_translate
    USE qmmmx_util,                      ONLY: apply_qmmmx_translate
-   USE space_groups,                    ONLY: spgr_apply_rotations_force,&
+   USE space_groups,                    ONLY: identify_space_group,&
+                                              print_spgr,&
+                                              spgr_apply_rotations_coord,&
+                                              spgr_apply_rotations_force,&
                                               spgr_apply_rotations_stress,&
                                               spgr_project_cell_metric,&
                                               spgr_write_stress_tensor
@@ -90,6 +101,7 @@ MODULE gopt_f_methods
 
    PUBLIC :: cp_eval_at, &
              gopt_f_create_x0, &
+             gopt_f_setup_space_group, &
              print_geo_opt_header, print_geo_opt_nc, &
              gopt_f_io_init, gopt_f_io, gopt_f_io_finalize, gopt_f_ii, &
              apply_cell_change
@@ -131,7 +143,7 @@ CONTAINS
          ! before starting we handle the case of translating coordinates (QM/MM)
          CALL apply_qmmm_translation(gopt_env)
          nparticle = force_env_get_nparticle(gopt_env%force_env)
-         ALLOCATE (x0(3*nparticle + 6))
+         ALLOCATE (x0(3*nparticle + n_slot))
          CALL pack_subsys_particles(subsys=subsys, r=x0)
          idg = 3*nparticle
          DO i = 1, 3
@@ -189,9 +201,11 @@ CONTAINS
 
       INTEGER                                            :: handle, idg, idir, ip, nparticle, nsize, &
                                                             shell_index
-      REAL(KIND=dp)                                      :: f_ts
+      LOGICAL                                            :: projected
+      REAL(KIND=dp)                                      :: f_ts, pdiff
       REAL(KIND=dp), DIMENSION(3, 3)                     :: av_ptens, av_ptens_opt
       REAL(KIND=dp), DIMENSION(:), POINTER               :: cell_gradient, gradient_ts
+      REAL(KIND=dp), DIMENSION(n_slot)                   :: g_red, q_cell
       TYPE(cell_type), POINTER                           :: cell
       TYPE(cp_subsys_type), POINTER                      :: subsys
       TYPE(particle_list_type), POINTER                  :: core_particles, particles, &
@@ -273,11 +287,6 @@ CONTAINS
                           "keyword MUST be defined in the input file for the "// &
                           "evaluation of the stress tensor, but none is found!")
          END IF
-         IF (gopt_env%cell_env%keep_volume) THEN
-            nparticle = force_env_get_nparticle(gopt_env%force_env)
-            idg = 3*nparticle
-            CALL rescale_new_cell_volume(cell%deth, x, idg)
-         END IF
 
          CALL apply_cell_change(gopt_env, cell, x, update_forces=.FALSE.)
          ! Possibly output the new cell used for the next calculation
@@ -303,7 +312,7 @@ CONTAINS
                   CPASSERT(ASSOCIATED(gradient))
                   nparticle = force_env_get_nparticle(gopt_env%force_env)
                   nsize = 3*nparticle
-                  CPASSERT((SIZE(gradient) == nsize + 6))
+                  CPASSERT((SIZE(gradient) == nsize + n_slot))
                   CALL pack_subsys_particles(subsys=subsys, f=gradient(1:nsize), fscale=-1.0_dp)
                   CALL apply_cell_change(gopt_env, cell, gradient, update_forces=.TRUE.)
                   IF (spgr%keep_space_group) THEN
@@ -311,24 +320,38 @@ CONTAINS
                      CALL spgr_apply_rotations_stress(spgr, cell, av_ptens)
                      CALL spgr_write_stress_tensor(av_ptens, spgr)
                   END IF
-                  cell_gradient => gradient(nsize + 1:nsize + 6)
+                  cell_gradient => gradient(nsize + 1:nsize + n_slot)
                   cell_gradient = 0.0_dp
                   av_ptens_opt = MATMUL(gopt_env%cell_env%input_to_opt, &
                                         MATMUL(av_ptens, gopt_env%cell_env%opt_to_input))
                   CALL get_dg_dh(cell_gradient, av_ptens_opt, gopt_env%cell_env%pres_ext, &
                                  gopt_env%cell_env%opt_cell, gopt_env%cell_env%mtrx, &
-                                 keep_angles=gopt_env%cell_env%keep_angles, &
-                                 keep_symmetry=gopt_env%cell_env%keep_symmetry, &
-                                 pres_int=gopt_env%cell_env%pres_int, &
-                                 pres_constr=gopt_env%cell_env%pres_constr, &
-                                 constraint_id=gopt_env%cell_env%constraint_id)
+                                 pres_int=gopt_env%cell_env%pres_int)
+                  q_cell = [gopt_env%cell_env%opt_cell%hmat(1, 1), &
+                            gopt_env%cell_env%opt_cell%hmat(1, 2), &
+                            gopt_env%cell_env%opt_cell%hmat(2, 2), &
+                            gopt_env%cell_env%opt_cell%hmat(1, 3), &
+                            gopt_env%cell_env%opt_cell%hmat(2, 3), &
+                            gopt_env%cell_env%opt_cell%hmat(3, 3)]
+                  CALL cell_manifold_proj_pressure(gopt_env%cell_env%manifold, q_cell, &
+                                                   cell_gradient, pdiff, projected)
+                  IF (projected) THEN
+                     gopt_env%cell_env%pres_constr = gopt_env%cell_env%pres_ext + pdiff
+                  ELSE
+                     gopt_env%cell_env%pres_constr = gopt_env%cell_env%pres_ext
+                  END IF
+                  IF (gopt_env%cell_env%manifold%k > 0) THEN
+                     CALL cell_manifold_project_grad(gopt_env%cell_env%manifold, cell_gradient, &
+                                                     g_red(1:gopt_env%cell_env%manifold%ndof))
+                     CALL cell_manifold_expand_step(gopt_env%cell_env%manifold, &
+                                                    g_red(1:gopt_env%cell_env%manifold%ndof), &
+                                                    cell_gradient)
+                  END IF
                END IF
                ! some callers expect pres_int to be available on all ranks. Also, here master is not necessarily a single rank.
                ! Assume at least master==0
                CALL para_env%bcast(gopt_env%cell_env%pres_int, 0)
-               IF (gopt_env%cell_env%constraint_id /= fix_none) THEN
-                  CALL para_env%bcast(gopt_env%cell_env%pres_constr, 0)
-               END IF
+               CALL para_env%bcast(gopt_env%cell_env%pres_constr, 0)
             END IF
          END BLOCK
       CASE (default_shellcore_method_id)
@@ -616,7 +639,10 @@ CONTAINS
             CPASSERT(PRESENT(ndf))
             CPASSERT(PRESENT(dx))
             CPASSERT(PRESENT(xi))
-            IF (gopt_env%cell_env%constraint_id == fix_none) THEN
+            ! Without active constraints the plain pressure test applies.
+            ! Any active constraint (CONSTRAINT or a KEEP_* flag) makes the
+            ! pressure test the projected one.
+            IF (gopt_env%cell_env%manifold%k == 0) THEN
                CALL check_and_report_convergence(output_unit, gopt_param, ndf, dx, xi, conv, &
                                                  max_memory, stress_unit, pres_diff, pres_tol)
             ELSE
@@ -1403,10 +1429,11 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:), POINTER               :: x
       LOGICAL, INTENT(IN)                                :: update_forces
 
-      INTEGER                                            :: i, iatom, idg, j, natom, nparticle, &
-                                                            shell_index
+      INTEGER                                            :: i, iatom, idg, info_manifold, j, natom, &
+                                                            nparticle, shell_index
       REAL(KIND=dp)                                      :: fc, fs, mass
       REAL(KIND=dp), DIMENSION(3)                        :: s
+      REAL(KIND=dp), DIMENSION(n_slot)                   :: du_zero, q_retracted
       TYPE(cell_type), POINTER                           :: cell_ref
       TYPE(cp_subsys_type), POINTER                      :: subsys
       TYPE(particle_list_type), POINTER                  :: core_particles, particles, &
@@ -1434,7 +1461,7 @@ CONTAINS
       ! Load the updated cell information
       idg = 3*nparticle
       CALL init_cell(cell_ref, hmat=gopt_env%h_ref)
-      CPASSERT((SIZE(x) == idg + 6))
+      CPASSERT((SIZE(x) == idg + n_slot))
 
       IF (update_forces) THEN
 
@@ -1467,6 +1494,36 @@ CONTAINS
                   x(idg) = gopt_env%cell_env%opt_cell%hmat(j, i)
                END DO
             END DO
+         END IF
+         IF (gopt_env%cell_env%manifold%k > 0) THEN
+            idg = 3*nparticle
+            du_zero = 0.0_dp
+            CALL cell_manifold_retract(gopt_env%cell_env%manifold, &
+                                       x(idg + 1:idg + n_slot), &
+                                       du_zero(1:gopt_env%cell_env%manifold%ndof), &
+                                       q_retracted, info_manifold)
+            IF (info_manifold /= info_ok) THEN
+               CALL cp_abort(__LOCATION__, "CELL_OPT: feasibility retraction failed (info="// &
+                             cp_to_string(info_manifold)//").")
+            END IF
+            x(idg + 1:idg + n_slot) = q_retracted
+            IF (gopt_env%cell_env%manifold%n_geom_rows > 0 .OR. &
+                gopt_env%cell_env%manifold%n_eq_rows > 0) THEN
+               CALL cell_manifold_update_basis(gopt_env%cell_env%manifold, &
+                                               q_retracted, info_manifold)
+               IF (info_manifold /= info_ok) THEN
+                  CALL cp_abort(__LOCATION__, "CELL_OPT: constraint basis update failed (info="// &
+                                cp_to_string(info_manifold)//").")
+               END IF
+            END IF
+            gopt_env%cell_env%opt_cell%hmat = 0.0_dp
+            DO i = 1, 3
+               DO j = 1, i
+                  idg = idg + 1
+                  gopt_env%cell_env%opt_cell%hmat(j, i) = x(idg)
+               END DO
+            END DO
+            CALL init_cell(gopt_env%cell_env%opt_cell)
          END IF
 
          ! Reconstruct the physical cell in the fixed orientation of the input cell.
@@ -1501,5 +1558,48 @@ CONTAINS
       CALL cell_release(cell_ref)
 
    END SUBROUTINE apply_cell_change
+
+! **************************************************************************************************
+!> \brief Identifies the space group, symmetrizes the start coordinates, and for
+!>        CELL_OPT symmetrizes the start cell metric and folds the point-group
+!>        constraint rows into the cell manifold.
+!> \param spgr ...
+!> \param subsys ...
+!> \param geo_section ...
+!> \param gopt_env ...
+!> \param x0 ...
+!> \param output_unit ...
+! **************************************************************************************************
+   SUBROUTINE gopt_f_setup_space_group(spgr, subsys, geo_section, gopt_env, x0, output_unit)
+      TYPE(spgr_type), POINTER                           :: spgr
+      TYPE(cp_subsys_type), POINTER                      :: subsys
+      TYPE(section_vals_type), POINTER                   :: geo_section
+      TYPE(gopt_f_type), POINTER                         :: gopt_env
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: x0
+      INTEGER, INTENT(IN)                                :: output_unit
+
+      IF (spgr%keep_space_group) THEN
+         CALL identify_space_group(subsys, geo_section, gopt_env, output_unit)
+         CALL spgr_apply_rotations_coord(spgr, x0)
+         CALL print_spgr(spgr)
+         IF (gopt_env%type_id == default_cell_method_id) THEN
+            ! Symmetrize the start cell metric and rebuild the manifold from it
+            ! before folding the point-group rows, so manifold%q0 and s0 match
+            ! the symmetrized start cell instead of any unsymmetrized input noise.
+            CALL spgr_project_cell_metric(spgr, gopt_env%cell_env%opt_cell)
+            x0(SIZE(x0) - n_slot + 1:SIZE(x0)) = &
+               [gopt_env%cell_env%opt_cell%hmat(1, 1), &
+                gopt_env%cell_env%opt_cell%hmat(1, 2), &
+                gopt_env%cell_env%opt_cell%hmat(2, 2), &
+                gopt_env%cell_env%opt_cell%hmat(1, 3), &
+                gopt_env%cell_env%opt_cell%hmat(2, 3), &
+                gopt_env%cell_env%opt_cell%hmat(3, 3)]
+            CALL cell_opt_setup_manifold(gopt_env%cell_env)
+            CALL cell_opt_fold_symmetry_rows(gopt_env%cell_env, &
+                                             spgr_point_group_symmetry_id(spgr, gopt_env%cell_env%opt_cell))
+         END IF
+      END IF
+
+   END SUBROUTINE gopt_f_setup_space_group
 
 END MODULE gopt_f_methods

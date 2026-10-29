@@ -29,6 +29,7 @@ MODULE cp_lbfgs_geo
    USE global_types,                    ONLY: global_environment_type
    USE gopt_f_methods,                  ONLY: gopt_f_ii,&
                                               gopt_f_io_finalize,&
+                                              gopt_f_setup_space_group,&
                                               print_geo_opt_header,&
                                               print_geo_opt_nc
    USE gopt_f_types,                    ONLY: gopt_f_type
@@ -39,8 +40,7 @@ MODULE cp_lbfgs_geo
    USE kinds,                           ONLY: dp
    USE message_passing,                 ONLY: mp_para_env_type
    USE space_groups,                    ONLY: identify_space_group,&
-                                              print_spgr,&
-                                              spgr_apply_rotations_coord
+                                              print_spgr
    USE space_groups_types,              ONLY: spgr_type
 #include "../base/base_uses.f90"
 
@@ -105,11 +105,7 @@ CONTAINS
       CALL print_geo_opt_header(gopt_env, output_unit, "L-BFGS")
 
       ! finds space group
-      IF (spgr%keep_space_group) THEN
-         CALL identify_space_group(subsys, geo_section, gopt_env, output_unit)
-         CALL spgr_apply_rotations_coord(spgr, x0)
-         CALL print_spgr(spgr)
-      END IF
+      CALL gopt_f_setup_space_group(spgr, subsys, geo_section, gopt_env, x0, output_unit)
 
       ! Stop if not implemented
       IF (gopt_env%type_id == default_ts_method_id) THEN

@@ -13,21 +13,22 @@
 ! **************************************************************************************************
 MODULE cell_opt_types
 
+   USE cell_manifold_utils,             ONLY: &
+        cell_manifold_init, cell_manifold_type, comp_bx, comp_cx, comp_cy, gfix_alpha, gfix_beta, &
+        gfix_gamma, gfix_v, info_ok, n_constraint_bits, n_geom, n_slot
    USE cell_methods,                    ONLY: canonicalize_cell_matrix,&
                                               cell_create
    USE cell_opt_utils,                  ONLY: cell_opt_constraint_label,&
-                                              keep_angles_conflict,&
-                                              keep_symmetry_conflict,&
-                                              keep_symmetry_coupled_set,&
-                                              mask_shear,&
                                               parse_cell_constraint,&
-                                              pres_crit_shear_pinned,&
-                                              read_external_press_tensor
+                                              read_external_press_tensor,&
+                                              symmetry_constraint_rows
    USE cell_types,                      ONLY: cell_clone,&
                                               cell_release,&
+                                              cell_sym_none,&
                                               cell_type
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
-                                              cp_logger_type
+                                              cp_logger_type,&
+                                              cp_to_string
    USE cp_output_handling,              ONLY: cp_print_key_finished_output,&
                                               cp_print_key_unit_nr
    USE cp_units,                        ONLY: cp_unit_from_cp2k
@@ -49,7 +50,9 @@ MODULE cell_opt_types
 
    PUBLIC :: cell_opt_env_type, &
              cell_opt_env_create, &
-             cell_opt_env_release
+             cell_opt_env_release, &
+             cell_opt_setup_manifold, &
+             cell_opt_fold_symmetry_rows
 
 ! **************************************************************************************************
 !> \brief Type containing all informations abour the simulation cell optimization
@@ -59,8 +62,9 @@ MODULE cell_opt_types
 ! **************************************************************************************************
    TYPE cell_opt_env_type
       ! Simulation cell optimization parameters
-      ! constraint_id is a mask of fixed cell components (comp_* / mask_*):
-      ! a set bit means fixed, 0 (= fix_none) leaves all components relaxable
+      ! constraint_id is a mask of fixed cell components and geometric
+      ! invariants (comp_* / gfix_*): a set bit means fixed, 0 (= fix_none)
+      ! leaves all degrees of freedom relaxable
       INTEGER                                    :: constraint_id = fix_none
       LOGICAL                                    :: keep_angles = .FALSE., &
                                                     keep_symmetry = .FALSE., &
@@ -72,6 +76,7 @@ MODULE cell_opt_types
       REAL(KIND=dp), DIMENSION(3, 3)             :: input_to_opt = 0.0_dp, &
                                                     opt_to_input = 0.0_dp
       TYPE(cell_type), POINTER                   :: opt_cell => NULL()
+      TYPE(cell_manifold_type)                   :: manifold
    END TYPE cell_opt_env_type
 
 CONTAINS
@@ -115,6 +120,18 @@ CONTAINS
                                 c_vals=constraint_tokens, explicit=constraint_explicit)
       CALL parse_cell_constraint(constraint_tokens, cell, constraint_explicit, &
                                  cell_env%constraint_id)
+
+      IF (cell_env%keep_symmetry .AND. cell_env%opt_cell%symmetry_id == cell_sym_none) THEN
+         ! The crystal system is only ever set by the SYMMETRY keyword of
+         ! &SUBSYS/&CELL (default NONE, no detection): without it there is
+         ! nothing to keep and the run silently proceeds unconstrained.
+         CALL cp_warn(__LOCATION__, &
+                      "CELL_OPT: KEEP_SYMMETRY is on, but &SUBSYS/&CELL SYMMETRY is not "// &
+                      "set (default NONE). No crystal system is known, so no symmetry "// &
+                      "constraint is applied. Set SYMMETRY to the crystal system of the "// &
+                      "cell to keep it during the optimization.")
+      END IF
+
       ! Only for explicitly set values: an unset keyword must stay unparsed so
       ! the restart echo keeps omitting the line, as it always has.
       IF (constraint_explicit) THEN
@@ -124,42 +141,7 @@ CONTAINS
          CALL section_vals_val_set(geo_section, "CONSTRAINT", c_vals_ptr=canonical_tokens)
       END IF
 
-      CALL cell_opt_validate_constraint(cell_env)
-
-      ! The masked pressure criterion is structurally off target for this
-      ! combination on a non-orthorhombic cell. The run stays legal: the
-      ! geometry criteria still work, and the pressure criterion may still
-      ! be met when the pinned shear stresses vanish by symmetry.
-      IF (pres_crit_shear_pinned(cell_env%constraint_id, &
-                                 cell_env%opt_cell%orthorhombic, &
-                                 cell_env%keep_angles)) THEN
-         IF (IAND(cell_env%constraint_id, mask_shear) /= 0) THEN
-            CALL cp_warn(__LOCATION__, &
-                         "CELL_OPT: CONSTRAINT ("// &
-                         TRIM(cell_opt_constraint_label(cell_env%constraint_id))// &
-                         ") pins a shear component of a non-orthorhombic cell. "// &
-                         "The masked pressure criterion is met at the constrained minimum "// &
-                         "only if the stresses conjugate to the pinned components vanish "// &
-                         "there, for example when the pinned values are the stress-free "// &
-                         "ones; otherwise it can stay off the external pressure. Check "// &
-                         "the per-step ""Pressure is converged"" line: with L-BFGS the "// &
-                         """run CONVERGED"" banner can appear while it is NO. The "// &
-                         "projected-stress criterion planned in #6031 removes this limitation.")
-         ELSE
-            CALL cp_warn(__LOCATION__, &
-                         "CELL_OPT: CONSTRAINT ("// &
-                         TRIM(cell_opt_constraint_label(cell_env%constraint_id))// &
-                         ") fixes a diagonal component while KEEP_ANGLES pins the "// &
-                         "angles of a non-orthorhombic cell. The masked pressure criterion "// &
-                         "is met at the constrained minimum only if the stresses conjugate "// &
-                         "to the pinned components vanish there, for example when the "// &
-                         "pinned values are the stress-free ones; otherwise it can stay "// &
-                         "off the external pressure. Check the per-step ""Pressure is "// &
-                         "converged"" line: with L-BFGS the ""run CONVERGED"" banner can "// &
-                         "appear while it is NO. The projected-stress criterion planned "// &
-                         "in #6031 removes this limitation.")
-         END IF
-      END IF
+      CALL cell_opt_setup_manifold(cell_env)
 
       ! Get the external pressure
       CALL read_external_press_tensor(geo_section, cell_env%opt_cell, cell_env%pres_ext, &
@@ -205,53 +187,131 @@ CONTAINS
    END SUBROUTINE cell_opt_env_create
 
 ! **************************************************************************************************
-!> \brief Abort on constraint combinations that corrupt the KEEP_* projections
+!> \brief Initialize the cell constraint manifold from CONSTRAINT, KEEP_SYMMETRY,
+!>        KEEP_ANGLES, and KEEP_VOLUME.
 !> \param cell_env ...
 ! **************************************************************************************************
-   SUBROUTINE cell_opt_validate_constraint(cell_env)
-      TYPE(cell_opt_env_type), INTENT(IN)                :: cell_env
+   SUBROUTINE cell_opt_setup_manifold(cell_env)
+      TYPE(cell_opt_env_type), INTENT(INOUT)             :: cell_env
 
-      LOGICAL                                            :: bad_constraint
+      INTEGER                                            :: angle_bits, b, info
+      REAL(KIND=dp)                                      :: q0(n_slot)
+      TYPE(cell_manifold_type)                           :: m_probe
 
-      ! Reject CONSTRAINT combinations that would silently corrupt the
-      ! KEEP_ANGLES projection or the KEEP_SYMMETRY symmetrization.
-      ! Slot order of apply_cell_constraints: AX, BX, BY, CX, CY, CZ.
-      ! KEEP_ANGLES projects the gradient slots {BX,BY} onto b and {CX,CY,CZ} onto c.
-      ! Gradient slots that a legacy value zeroes:
-      !    x  = {AX,BX,CX}          B partial,  C partial   -> breaks parallelism
-      !    y  = {BX,BY,CY}          B complete, C partial   -> breaks parallelism
-      !    z  = {CX,CY,CZ}          B untouched, C complete -> safe
-      !    xy = {AX..CY}            B complete, C partial   -> breaks parallelism
-      !    xz = {AX,BX,CX,CY,CZ}    B partial,  C complete  -> breaks parallelism
-      !    yz = {BX..CZ}            B complete, C complete  -> safe
-      ! A partial group breaks the parallelism. A complete or untouched group keeps it.
+      q0 = [cell_env%opt_cell%hmat(1, 1), cell_env%opt_cell%hmat(1, 2), &
+            cell_env%opt_cell%hmat(2, 2), cell_env%opt_cell%hmat(1, 3), &
+            cell_env%opt_cell%hmat(2, 3), cell_env%opt_cell%hmat(3, 3)]
+
+      ! Validate explicit CONSTRAINT tokens first so redundant explicit tokens
+      ! (such as CONSTRAINT A LENGTH_A) fail LICQ immediately.
+      CALL cell_manifold_init(cell_env%manifold, q0, cell_env%constraint_id, info)
+      IF (info /= info_ok) THEN
+         CALL cp_abort(__LOCATION__, &
+                       "CELL_OPT: degenerate constraint set (info="// &
+                       cp_to_string(info)//"): the active constraints are linearly "// &
+                       "dependent and do not define a manifold.")
+      END IF
+
+      IF (cell_env%keep_symmetry) THEN
+         CALL cell_opt_fold_symmetry_rows(cell_env, cell_env%opt_cell%symmetry_id)
+      END IF
+
       IF (cell_env%keep_angles) THEN
-         IF (keep_angles_conflict(cell_env%constraint_id, &
-                                  cell_env%opt_cell%orthorhombic)) THEN
-            CALL cp_abort(__LOCATION__, &
-                          "CELL_OPT: CONSTRAINT ("// &
-                          TRIM(cell_opt_constraint_label(cell_env%constraint_id))// &
-                          ") fixes only part of the b or c cell vector and would "// &
-                          "destroy the KEEP_ANGLES projection.")
+         ! On an orthorhombic cell, pinning BX = CX = CY = 0 is identical to
+         ! pinning alpha = beta = gamma = 90 deg and keeps off-diagonal hmat
+         ! entries identically 0.0_dp so cell%orthorhombic stays TRUE.
+         IF (cell_env%opt_cell%orthorhombic) THEN
+            angle_bits = comp_bx + comp_cx + comp_cy
+         ELSE
+            angle_bits = gfix_alpha + gfix_beta + gfix_gamma
+         END IF
+         DO b = 0, n_constraint_bits - 1
+            IF (BTEST(angle_bits, b) .AND. .NOT. BTEST(cell_env%manifold%mask, b)) THEN
+               CALL cell_manifold_init(m_probe, q0, IBSET(cell_env%manifold%mask, b), info, &
+                                       lin_w=cell_env%manifold%lin_w, &
+                                       n_lin_rows=cell_env%manifold%n_lin_rows, &
+                                       eq_pair=cell_env%manifold%eq_pair, &
+                                       n_eq_rows=cell_env%manifold%n_eq_rows)
+               IF (info == info_ok) cell_env%manifold = m_probe
+            END IF
+         END DO
+      END IF
+
+      IF (cell_env%keep_volume) THEN
+         IF (IAND(cell_env%manifold%mask, gfix_v) == 0) THEN
+            CALL cell_manifold_init(m_probe, q0, IOR(cell_env%manifold%mask, gfix_v), info, &
+                                    lin_w=cell_env%manifold%lin_w, &
+                                    n_lin_rows=cell_env%manifold%n_lin_rows, &
+                                    eq_pair=cell_env%manifold%eq_pair, &
+                                    n_eq_rows=cell_env%manifold%n_eq_rows)
+            IF (info == info_ok) cell_env%manifold = m_probe
          END IF
       END IF
 
-      IF (cell_env%keep_symmetry .AND. cell_env%constraint_id /= fix_none) THEN
-         bad_constraint = keep_symmetry_conflict(cell_env%constraint_id, &
-                                                 cell_env%opt_cell%symmetry_id)
-         IF (bad_constraint) THEN
-            CALL cp_abort(__LOCATION__, &
-                          "CELL_OPT: CONSTRAINT ("// &
-                          TRIM(cell_opt_constraint_label(cell_env%constraint_id))// &
-                          ") fixes only part of the components coupled by "// &
-                          "KEEP_SYMMETRY ("// &
-                          TRIM(cell_opt_constraint_label( &
-                               keep_symmetry_coupled_set(cell_env%opt_cell%symmetry_id)))// &
-                          ") and would break the cell symmetry.")
-         END IF
-      END IF
+   END SUBROUTINE cell_opt_setup_manifold
 
-   END SUBROUTINE cell_opt_validate_constraint
+! **************************************************************************************************
+!> \brief Greedily add the crystal-system rows of symmetry_id to the manifold.
+!> \param cell_env ...
+!> \param symmetry_id ...
+!> \note Each row joins only when the extended set still passes the rank
+!>       check, so rows folded earlier (KEEP_SYMMETRY with &CELL SYMMETRY)
+!>       are skipped. KEEP_SPACE_GROUP calls this with the point group of
+!>       its identified space group: the point group pins the cell metric
+!>       exactly like the crystal system of that group.
+! **************************************************************************************************
+   SUBROUTINE cell_opt_fold_symmetry_rows(cell_env, symmetry_id)
+      TYPE(cell_opt_env_type), INTENT(INOUT)             :: cell_env
+      INTEGER, INTENT(IN)                                :: symmetry_id
+
+      INTEGER                                            :: b, cand_eq_pair(n_geom, 2), cand_n_eq, &
+                                                            cand_n_lin, i, info, sym_bits
+      REAL(KIND=dp)                                      :: cand_lin_w(n_slot, n_slot)
+      TYPE(cell_manifold_type)                           :: m_probe
+
+      CALL symmetry_constraint_rows(symmetry_id, sym_bits, cand_lin_w, cand_n_lin, &
+                                    cand_eq_pair, cand_n_eq)
+      DO b = 0, n_slot - 1
+         IF (BTEST(sym_bits, b) .AND. .NOT. BTEST(cell_env%manifold%mask, b)) THEN
+            CALL cell_manifold_init(m_probe, cell_env%manifold%q0, &
+                                    IBSET(cell_env%manifold%mask, b), info, &
+                                    lin_w=cell_env%manifold%lin_w, &
+                                    n_lin_rows=cell_env%manifold%n_lin_rows, &
+                                    eq_pair=cell_env%manifold%eq_pair, &
+                                    n_eq_rows=cell_env%manifold%n_eq_rows)
+            IF (info == info_ok) cell_env%manifold = m_probe
+         END IF
+      END DO
+      DO i = 1, cand_n_lin
+         IF (cell_env%manifold%n_lin_rows >= n_slot) EXIT
+         cell_env%manifold%lin_w(:, cell_env%manifold%n_lin_rows + 1) = cand_lin_w(:, i)
+         CALL cell_manifold_init(m_probe, cell_env%manifold%q0, cell_env%manifold%mask, info, &
+                                 lin_w=cell_env%manifold%lin_w, &
+                                 n_lin_rows=cell_env%manifold%n_lin_rows + 1, &
+                                 eq_pair=cell_env%manifold%eq_pair, &
+                                 n_eq_rows=cell_env%manifold%n_eq_rows)
+         IF (info == info_ok) THEN
+            cell_env%manifold = m_probe
+         ELSE
+            cell_env%manifold%lin_w(:, cell_env%manifold%n_lin_rows + 1) = 0.0_dp
+         END IF
+      END DO
+      DO i = 1, cand_n_eq
+         IF (cell_env%manifold%n_eq_rows >= n_geom) EXIT
+         cell_env%manifold%eq_pair(cell_env%manifold%n_eq_rows + 1, :) = cand_eq_pair(i, :)
+         CALL cell_manifold_init(m_probe, cell_env%manifold%q0, cell_env%manifold%mask, info, &
+                                 lin_w=cell_env%manifold%lin_w, &
+                                 n_lin_rows=cell_env%manifold%n_lin_rows, &
+                                 eq_pair=cell_env%manifold%eq_pair, &
+                                 n_eq_rows=cell_env%manifold%n_eq_rows + 1)
+         IF (info == info_ok) THEN
+            cell_env%manifold = m_probe
+         ELSE
+            cell_env%manifold%eq_pair(cell_env%manifold%n_eq_rows + 1, :) = 0
+         END IF
+      END DO
+
+   END SUBROUTINE cell_opt_fold_symmetry_rows
 
 ! **************************************************************************************************
 !> \brief ...

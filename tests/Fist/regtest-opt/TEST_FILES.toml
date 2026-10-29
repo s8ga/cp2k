@@ -33,10 +33,10 @@
 "cell_sym_hexagonal_gamma_60.inp"              = [{matcher = "M011", tol = 4e-09, ref = -129.05206533232612}]
 "cell_sym_hexagonal.inp"                       = [{matcher = "M011", tol = 4e-09, ref = -129.05206533232612}]
 "cell_sym_monoclinic.inp"                      = [{matcher = "M011", tol = 1e-08, ref = -129.28637033131494}]
-"cell_sym_monoclinic_gamma_ab.inp"             = [{matcher = "M011", tol = 1e-08, ref = -129.23692670296523}]
+"cell_sym_monoclinic_gamma_ab.inp"             = [{matcher = "M011", tol = 1e-08, ref = -129.2369280639239}]
 "cell_sym_none.inp"                            = [{matcher = "M011", tol = 1e-08, ref = -129.28637032411459}]
 "cell_sym_orthorhombic.inp"                    = [{matcher = "M011", tol = 1e-08, ref = -129.28636945323004}]
-"cell_sym_rhombohedral.inp"                    = [{matcher = "M011", tol = 1e-08, ref = -129.03437105082563}]
+"cell_sym_rhombohedral.inp"                    = [{matcher = "M011", tol = 1e-08, ref = -129.12247803642651}]
 "cell_sym_tetragonal_ab.inp"                   = [{matcher = "M011", tol = 1e-08, ref = -129.2369243617301}]
 "cell_sym_tetragonal_ac.inp"                   = [{matcher = "M011", tol = 1e-08, ref = -129.22195126442756}]
 "cell_sym_tetragonal_bc.inp"                   = [{matcher = "M011", tol = 1e-08, ref = -129.12318608682179}]
@@ -104,8 +104,8 @@
   {matcher = "Cell_angle_alpha", tol = 1.0E-9, ref = 89.000000}
 ]
 # Cell optimisation with fixed volume
-"cell_opt_keep_volume.inp"                     = [{matcher = "M011", tol = 1.0E-10, ref = -16.136339196984437}]
-"cell_opt_keep_volume_symmetry.inp"            = [{matcher = "M011", tol = 1.0E-10, ref = -16.13633919692934}]
+"cell_opt_keep_volume.inp"                     = [{matcher = "M011", tol = 1.0E-10, ref = -16.144141969737117}]
+"cell_opt_keep_volume_symmetry.inp"            = [{matcher = "M011", tol = 1.0E-10, ref = -16.14414196974569}]
 # Inverse BFGS
 "geo_opt_bfgs_inverse.inp"                     = [{matcher = "M011", tol = 1.0E-14, ref = -35.282422070543689}]
 "cell_opt_direct_bfgs_inverse.inp"             = [{matcher = "M011", tol = 1.0E-14, ref = -35.644084205321576}]

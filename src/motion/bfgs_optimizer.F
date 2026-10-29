@@ -18,7 +18,9 @@ MODULE bfgs_optimizer
                                               get_atomic_kind_set
    USE bibliography,                    ONLY: Lindh1995,&
                                               cite_reference
-   USE cell_opt_utils,                  ONLY: apply_cell_constraints
+   USE cell_manifold_utils,             ONLY: cell_manifold_expand_step,&
+                                              cell_manifold_project_grad,&
+                                              n_slot
    USE cell_types,                      ONLY: cell_type,&
                                               pbc
    USE constraint_fxd,                  ONLY: fix_atom_control
@@ -61,6 +63,7 @@ MODULE bfgs_optimizer
                                               gopt_f_io,&
                                               gopt_f_io_finalize,&
                                               gopt_f_io_init,&
+                                              gopt_f_setup_space_group,&
                                               print_geo_opt_header,&
                                               print_geo_opt_nc
    USE gopt_f_types,                    ONLY: gopt_f_type
@@ -321,11 +324,7 @@ CONTAINS
       dr(:) = 0.0_dp
 
       ! find space_group
-      IF (spgr%keep_space_group) THEN
-         CALL identify_space_group(subsys, geo_section, gopt_env, output_unit)
-         CALL spgr_apply_rotations_coord(spgr, x0)
-         CALL print_spgr(spgr)
-      END IF
+      CALL gopt_f_setup_space_group(spgr, subsys, geo_section, gopt_env, x0, output_unit)
 
       ! Geometry optimization starts now
       CALL cp_iterate(logger%iter_info, increment=0, iter_nr_out=iter_nr)
@@ -657,14 +656,20 @@ CONTAINS
 ! **************************************************************************************************
    SUBROUTINE bfgs_project_cell_step(gopt_env, dr)
       TYPE(gopt_f_type), POINTER                         :: gopt_env
-      REAL(KIND=dp), DIMENSION(:), INTENT(INOUT), TARGET :: dr
+      REAL(KIND=dp), DIMENSION(:), INTENT(INOUT)         :: dr
 
-      REAL(KIND=dp), DIMENSION(:), POINTER               :: cell_step
+      INTEGER                                            :: nsize
+      REAL(KIND=dp)                                      :: cell_step(n_slot), g_red(n_slot)
 
-      cell_step => dr(SIZE(dr) - 5:SIZE(dr))
-      CALL apply_cell_constraints(cell_step, gopt_env%cell_env%opt_cell, &
-                                  gopt_env%cell_env%keep_angles, gopt_env%cell_env%keep_symmetry, &
-                                  gopt_env%cell_env%constraint_id)
+      IF (gopt_env%cell_env%manifold%k > 0) THEN
+         nsize = SIZE(dr) - n_slot
+         cell_step = dr(nsize + 1:nsize + n_slot)
+         CALL cell_manifold_project_grad(gopt_env%cell_env%manifold, cell_step, &
+                                         g_red(1:gopt_env%cell_env%manifold%ndof))
+         CALL cell_manifold_expand_step(gopt_env%cell_env%manifold, &
+                                        g_red(1:gopt_env%cell_env%manifold%ndof), &
+                                        dr(nsize + 1:nsize + n_slot))
+      END IF
    END SUBROUTINE bfgs_project_cell_step
 
 ! **************************************************************************************************

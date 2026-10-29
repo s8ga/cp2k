@@ -1089,16 +1089,15 @@ CONTAINS
          "C = CX, CY and CZ. X, Y and Z follow the legacy direction tokens. X fixes every x "// &
          "component: AX, BX and CX. Y fixes the complete b vector and the y component of c: "// &
          "BX, BY and CY. Z fixes the complete c vector, because only c has a z component: Z equals C. "// &
-         "Accepted tokens: NONE, A, B, C, X, Y, Z, XY, XZ, YZ, AX, BX, BY, CX, CY, CZ. "// &
-         "Several tokens may be given on one line, the union of the fixed components is used. "// &
-         "NONE must stand alone, redundant tokens give a warning, and angle constraints "// &
-         "(ALPHA, BETA, GAMMA) are not supported yet. On a non-orthorhombic cell a constraint "// &
-         "that pins a shear component (BX, CX, CY), or a fixed diagonal component together "// &
-         "with KEEP_ANGLES, draws a warning: the pressure criterion is then met only when "// &
-         "the pinned values match the stress-free cell; otherwise it can stay off the "// &
-         "external pressure at the constrained minimum. Check the per-step pressure "// &
-         "convergence report.", &
-         usage="CONSTRAINT {NONE} | ({A|B|C|X|Y|Z|XY|XZ|YZ|AX|BX|BY|CX|CY|CZ} ...)", &
+         "Accepted tokens: NONE, A, B, C, X, Y, Z, XY, XZ, YZ, AX, BX, BY, CX, CY, CZ, "// &
+         "the lengths LENGTH_A, LENGTH_B, LENGTH_C, the angles ALPHA, BETA, GAMMA, and "// &
+         "VOLUME (or V). Each geometric token pins its value to the one of the starting "// &
+         "cell. Several tokens may be given on one line, the union of the fixed components "// &
+         "is used. NONE must stand alone, redundant tokens give a warning. With any "// &
+         "constraint active, the pressure convergence check uses the stress projected on "// &
+         "the directions the cell can still relax.", &
+         usage="CONSTRAINT {NONE} | ({A|B|C|X|Y|Z|XY|XZ|YZ|AX|BX|BY|CX|CY|CZ} | "// &
+         "{LENGTH_A|LENGTH_B|LENGTH_C|ALPHA|BETA|GAMMA|VOLUME|V}) ...", &
          type_of_var=char_t, n_var=-1, default_c_vals=["NONE"])
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
