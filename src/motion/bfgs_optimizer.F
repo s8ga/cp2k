@@ -105,7 +105,10 @@ MODULE bfgs_optimizer
    ! Both matrix representations share one restart format and the existing file name.
    CHARACTER(LEN=16), PARAMETER         :: bfgs_restart_magic = "CP2K BFGS STATE "
    INTEGER, PARAMETER                   :: bfgs_restart_version = 1
+   REAL(KIND=dp), PARAMETER             :: amort_kappa = 4.0_dp
+   REAL(KIND=dp), PARAMETER             :: max_trust_radius = 1.0_dp
    REAL(KIND=dp), PARAMETER             :: min_hessian_eigenvalue = 1.0e-4_dp
+   REAL(KIND=dp), PARAMETER             :: min_trust_radius = 1.0e-3_dp
 
    PUBLIC :: bfgs_read_restart_header, geoopt_bfgs
 
@@ -132,17 +135,21 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:), POINTER               :: x0
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'geoopt_bfgs'
-      REAL(KIND=dp), PARAMETER                           :: one = 1.0_dp, zero = 0.0_dp
+      INTEGER, PARAMETER                                 :: max_step_rejections = 3
+      REAL(KIND=dp), PARAMETER :: cubic_tol = 50.0_dp, decay_del = 0.958_dp, del_min = 1.0E-5_dp, &
+         kappa_cons = 0.5_dp, kappa_rej = 1.5_dp, min_step_sample = 1.0E-9_dp, one = 1.0_dp, &
+         pred_abs_floor = 1.0E-12_dp, pred_rel_floor = 1.0E-10_dp, rfo_pole_offset = 0.01_dp, &
+         s_small = 0.02_dp, shrink_factor = 0.25_dp, spgr_norm_tol = 1.0E-6_dp, zero = 0.0_dp
 
       CHARACTER(LEN=5)                                   :: wildcard
       INTEGER                                            :: handle, info, iter_nr, its, &
-                                                            matrix_method, maxiter, ndf, &
+                                                            matrix_method, maxiter, n_rej, ndf, &
                                                             output_unit
-      LOGICAL :: capped_explicit, capped_step_conv, conv, hesrest, hess_reset, inverse, &
-         shell_present, should_stop, use_mod_hes, use_rfo
-      REAL(KIND=dp)                                      :: ediff, eig_floor, emin, eold, etot, &
-                                                            pred, rad, rat, step, t_diff, t_now, &
-                                                            t_old
+      LOGICAL :: adaptive_explicit, adaptive_tr, capped_explicit, capped_step_conv, conv, &
+         delhat_resolved, floor_active, grad_conv, hesrest, hess_reset, inverse, &
+         secant_consistent, shell_present, should_stop, step_rejected, use_mod_hes, use_rfo
+      REAL(KIND=dp) :: delhat, delhat_eff, dres, ediff, eig_floor, emin, eold, etot, ln_shift, &
+         pred, pred_floor, r_eff, rad, rad_shrunk, rat, rho, snorm, step, t_diff, t_now, t_old
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: dg, dr, dx, eigval, gold, work, xold
       REAL(KIND=dp), DIMENSION(:), POINTER               :: g
       TYPE(atomic_kind_list_type), POINTER               :: atomic_kinds
@@ -199,7 +206,17 @@ CONTAINS
          END IF
          capped_step_conv = .FALSE.
       END IF
-      IF (inverse) THEN
+      CALL section_vals_val_get(geo_section, "BFGS%ADAPTIVE_TRUST_RADIUS", l_val=adaptive_tr, &
+                                explicit=adaptive_explicit)
+      IF (use_rfo) THEN
+         IF (adaptive_explicit .AND. adaptive_tr) THEN
+            CALL cp_abort(__LOCATION__, &
+                          "BFGS ADAPTIVE_TRUST_RADIUS cannot be combined with USE_RAT_FUN_OPT")
+         END IF
+         adaptive_tr = .FALSE.
+      END IF
+      IF (inverse) adaptive_tr = .FALSE.
+      IF (inverse .OR. adaptive_tr) THEN
          IF (.NOT. ieee_is_finite(rad) .OR. rad <= 0.0_dp) THEN
             CALL cp_abort(__LOCATION__, &
                           "BFGS TRUST_RADIUS must be finite and positive")
@@ -219,6 +236,10 @@ CONTAINS
          ELSE
             WRITE (UNIT=output_unit, FMT="(/,T2,A,T78,A3)") &
                "BFGS| Use rational function optimization for step estimation: ", " NO"
+         END IF
+         IF (adaptive_tr) THEN
+            WRITE (UNIT=output_unit, FMT="(T2,A,T78,A3)") &
+               "BFGS| Adaptive trust radius: ", "YES"
          END IF
          IF (use_mod_hes) THEN
             WRITE (UNIT=output_unit, FMT="(T2,A,T78,A3)") &
@@ -350,12 +371,25 @@ CONTAINS
       t_diff = t_now - t_old
       t_old = t_now
       CALL gopt_f_io_init(gopt_env, output_unit, etot, wildcard=wildcard, its=iter_nr, used_time=t_diff)
+      step_rejected = .FALSE.
+      n_rej = 0
+      delhat = 0.0_dp
+      dres = 0.0_dp
+      snorm = 0.0_dp
+      delhat_resolved = .FALSE.
+      floor_active = .FALSE.
       DO its = iter_nr + 1, maxiter
          CALL cp_iterate(logger%iter_info, last=(its == maxiter))
          CALL section_vals_val_set(geo_section, "STEP_START_VAL", i_val=its)
          CALL gopt_f_ii(its, output_unit)
 
-         IF ((its - iter_nr) > 1) THEN
+         ! Skip the secant update when the previous step crossed an SCF
+         ! discontinuity or noise floor where energy and forces disagree.
+         secant_consistent = .TRUE.
+         IF (adaptive_tr) THEN
+            secant_consistent = ABS(dres) <= MAX(del_min, cubic_tol*snorm**3)
+         END IF
+         IF ((its - iter_nr) > 1 .AND. .NOT. step_rejected .AND. secant_consistent) THEN
             ! Symmetrize old coordinates and old forces.
             CALL gopt_f_project_coord(gopt_env, xold)
             CALL gopt_f_project_vector(gopt_env, gold)
@@ -388,6 +422,9 @@ CONTAINS
          ! Setting the present positions & gradients as old
          xold(:) = x0
          gold(:) = g
+         grad_conv = MAXVAL(ABS(g(1:ndf))) <= gopt_param%max_force .AND. &
+                     DOT_PRODUCT(g(1:ndf), g(1:ndf)) <= gopt_param%rms_force**2*REAL(ndf, KIND=dp)
+         IF (grad_conv) floor_active = .FALSE.
 
          IF (inverse) THEN
             CALL bfgs_inverse_step(hess_mat, g, dr)
@@ -408,12 +445,32 @@ CONTAINS
                CALL choose_eigv_solver(hess_tmp, eigvec_mat, eigval)
             END IF
 
+            ! Amortization floor: once an energy discontinuity is resolved, raise
+            ! the radius to the smallest one whose model descent out-runs it,
+            ! except on a rejection retry or once forces already satisfy tolerances.
+            IF (adaptive_tr .AND. delhat_resolved .AND. &
+                .NOT. step_rejected .AND. .NOT. grad_conv) THEN
+               CALL eigvec_gradient(ndf, eigvec_mat, g, dg, para_env)
+               CALL amort_floor(ndf, dg, eigval, delhat, rad, output_unit, floor_active)
+            END IF
+
             IF (use_rfo) THEN
                CALL set_hes_eig(ndf, eigval, work)
                dx(:) = eigval
                CALL rat_fun_opt(ndf, dg, eigval, work, eigvec_mat, g, para_env)
+               CALL geoopt_get_step(ndf, eigval, eigvec_mat, hess_tmp, dr, g, para_env, .TRUE.)
+            ELSE IF (adaptive_tr) THEN
+               ! Levenberg-Marquardt step into work(:), preserving eigval(:) for
+               ! CAPPED_STEP_CONVERGENCE. A spectrum with nonpositive eigenvalues
+               ! has no interior reference; start left of the lowest pole instead.
+               CALL eigvec_gradient(ndf, eigvec_mat, g, dg, para_env)
+               ln_shift = 0.0_dp
+               IF (eigval(1) <= 0.0_dp) ln_shift = eigval(1) - rfo_pole_offset
+               CALL rs_rfo_shift(ndf, dg, eigval, work, ln_shift, rad, output_unit)
+               CALL geoopt_get_step(ndf, work, eigvec_mat, hess_tmp, dr, g, para_env, .TRUE.)
+            ELSE
+               CALL geoopt_get_step(ndf, eigval, eigvec_mat, hess_tmp, dr, g, para_env, .FALSE.)
             END IF
-            CALL geoopt_get_step(ndf, eigval, eigvec_mat, hess_tmp, dr, g, para_env, use_rfo)
 
          END IF
          CALL gopt_f_project_step(gopt_env, dr)
@@ -426,6 +483,16 @@ CONTAINS
                rat = rad/step
                dr(:) = rat*dr(:)
                step = rad
+            END IF
+         ELSE IF (adaptive_tr) THEN
+            step = MAXVAL(ABS(dr))
+            snorm = NORM2(dr)
+            ! Space-group symmetrization may enlarge the step beyond the
+            ! region the restricted solve guaranteed.
+            r_eff = rad*rs_rfo_scale(ndf)
+            IF (gopt_env%spgr%keep_space_group .AND. snorm > r_eff*(one + spgr_norm_tol)) THEN
+               dr(:) = dr(:)*(r_eff/snorm)
+               snorm = r_eff
             END IF
          ELSE
             CALL trust_radius(ndf, step, rad, rat, dr, output_unit)
@@ -451,6 +518,38 @@ CONTAINS
          IF (.NOT. inverse) CALL energy_predict(ndf, work, hess_mat, dr, gold, pred, para_env)
 
          ediff = etot - eold
+
+         IF (adaptive_tr) THEN
+            ! rho > 0 whenever the true change agrees with the signed model
+            ! prediction (pred < 0 on descent, Schlegel eq. 17 convention); a
+            ! degenerate model prediction counts as zero.
+            pred_floor = MAX(pred_abs_floor, pred_rel_floor*ABS(etot))
+            rho = 0.0_dp
+            IF (pred < 0.0_dp .AND. ABS(pred) >= pred_floor) rho = ediff/pred
+            rat = rho
+
+            ! Energy-force consistency residual ediff - 0.5*(gold+g).dr: zero
+            ! on a consistent surface, of the order of the SCF-truncation
+            ! discontinuity across a cliff. Sampled on small steps only, where
+            ! the O(|s|^3) trapezoid error cannot mask the signal.
+            dres = ediff - 0.5_dp*(DOT_PRODUCT(gold(1:ndf), dr(1:ndf)) + &
+                                   DOT_PRODUCT(g(1:ndf), dr(1:ndf)))
+            delhat = decay_del*delhat
+            IF (snorm > min_step_sample .AND. snorm <= s_small .AND. &
+                ABS(dres) >= MAX(del_min, cubic_tol*snorm**3)) THEN
+               delhat = MAX(delhat, ABS(dres))
+               IF (.NOT. delhat_resolved) THEN
+                  delhat_resolved = .TRUE.
+                  IF (output_unit > 0) THEN
+                     WRITE (UNIT=output_unit, FMT="(T2,A,ES12.4)") &
+                        " BFGS| Energy discontinuity of the surface estimated at ", delhat
+                     CALL m_flush(output_unit)
+                  END IF
+               END IF
+            END IF
+         END IF
+         delhat_eff = 0.0_dp
+         IF (delhat_resolved) delhat_eff = delhat
 
          ! Symmetrize forces
          CALL gopt_f_project_vector(gopt_env, g)
@@ -487,9 +586,74 @@ CONTAINS
                            step, rad, used_time=t_diff)
          END IF
 
+         ! The convergence criteria are the contract, so a criteria-green
+         ! step exits even when it raised the energy; say so when it happens.
+         IF (conv .AND. ediff > 0.0_dp .AND. adaptive_tr) THEN
+            IF (output_unit > 0) THEN
+               WRITE (UNIT=output_unit, FMT="(T2,A,ES12.4)") &
+                  " BFGS| Converged on a step that raised the energy by ", ediff
+               IF (delhat_resolved .AND. ediff > delhat_eff) THEN
+                  WRITE (UNIT=output_unit, FMT="(T2,A,ES12.4)") &
+                     " BFGS| The rise exceeds the estimated energy discontinuity ", delhat_eff
+               END IF
+               CALL m_flush(output_unit)
+            END IF
+         END IF
          IF (conv .OR. (its == maxiter)) EXIT
          IF (etot < emin) emin = etot
-         IF (use_rfo) CALL update_trust_rad(rat, rad, step, ediff)
+
+         ! Reject a step that raised the energy: roll back to the stored
+         ! anchors and re-solve with the shrunk radius on the next pass
+         ! (no new force evaluation; the Hessian update is skipped).
+         IF (adaptive_tr .AND. ediff > kappa_rej*delhat_eff) THEN
+            rad_shrunk = MAX(shrink_factor*snorm/rs_rfo_scale(ndf), min_trust_radius)
+            IF (n_rej < max_step_rejections .AND. rad_shrunk < rad) THEN
+               ! The excursion carries curvature information: ediff > 0 with
+               ! a descent direction gold.dr < 0 implies s.y > -2 gold.s > 0
+               ! up to O(|s|^3) - provided the energy and the forces agree.
+               ! Across an SCF-truncation cliff they do not, so feed the pair
+               ! only where the consistency residual stays small.
+               IF (DOT_PRODUCT(gold(1:ndf), dr(1:ndf)) < 0.0_dp .AND. &
+                   DOT_PRODUCT(g(1:ndf), dr(1:ndf)) > DOT_PRODUCT(gold(1:ndf), dr(1:ndf)) .AND. &
+                   (delhat_eff <= 0.0_dp .OR. ABS(dres) <= kappa_cons*delhat_eff)) THEN
+                  dx(1:ndf) = dr(1:ndf)
+                  dg(1:ndf) = g(1:ndf) - gold(1:ndf)
+                  CALL bfgs(ndf, dx, dg, hess_mat, work, para_env, output_unit, hess_reset)
+                  IF (hess_reset) THEN
+                     CALL build_initial_hess(hess_mat, hess_tmp, eigvec_mat, eigval, force_env, &
+                                             use_mod_hes, .FALSE.)
+                  END IF
+               END IF
+               x0 = xold
+               g = gold
+               etot = eold
+               rad = rad_shrunk
+               n_rej = n_rej + 1
+               step_rejected = .TRUE.
+               IF (output_unit > 0) THEN
+                  WRITE (UNIT=output_unit, FMT="(T2,A,ES12.4,A,F8.5)") &
+                     " BFGS| Step rejected (energy rose by ", ediff, &
+                     "), trust radius shrunk to ", rad
+                  CALL m_flush(output_unit)
+               END IF
+               CYCLE
+            ELSE IF (rad_shrunk >= rad) THEN
+               IF (output_unit > 0) THEN
+                  WRITE (UNIT=output_unit, FMT="(T2,A,ES12.4)") &
+                     " BFGS| Uphill step accepted, the trust radius cannot shrink further, energy rose by ", ediff
+                  CALL m_flush(output_unit)
+               END IF
+            ELSE
+               CPWARN("BFGS step rejected three times, accepting")
+            END IF
+         END IF
+         IF (use_rfo) THEN
+            CALL update_trust_rad(rat, rad, step, ediff)
+         ELSE IF (adaptive_tr) THEN
+            CALL update_adaptive_trust_rad(ndf, rho, snorm, rad, step_rejected, output_unit)
+         END IF
+         step_rejected = .FALSE.
+         n_rej = 0
       END DO
 
       IF (its == maxiter .AND. (.NOT. conv)) THEN
@@ -1063,6 +1227,320 @@ CONTAINS
    END SUBROUTINE rat_fun_opt
 
 ! **************************************************************************************************
+!> \brief Trust-region size normalization: the step 2-norm is bounded by
+!>        rad*rs_rfo_scale(ndf). Restores the pre-2012 sqrt(log10(ndf))
+!>        normalization of this routine (a pure 2-norm bound shrinks
+!>        delocalized steps by sqrt(ndf), an RMS bound grows localized
+!>        steps by the same factor).
+!> \param ndf Number of degrees of freedom
+!> \return Scale factor sqrt(max(1, log10(ndf)))
+! **************************************************************************************************
+   PURE FUNCTION rs_rfo_scale(ndf) RESULT(scale)
+
+      INTEGER, INTENT(IN)                                :: ndf
+      REAL(KIND=dp)                                      :: scale
+
+      scale = SQRT(MAX(1.0_dp, LOG10(REAL(ndf, KIND=dp))))
+
+   END FUNCTION rs_rfo_scale
+
+! **************************************************************************************************
+!> \brief Project the gradient onto the eigenvector basis: dg = V^T g, replicated.
+!> \param ndf Number of optimization variables
+!> \param eigvec_mat Eigenvector matrix
+!> \param g Gradient in the optimization coordinates
+!> \param dg Gradient components in the eigenvector basis
+!> \param para_env Parallel environment of the matrix
+! **************************************************************************************************
+   SUBROUTINE eigvec_gradient(ndf, eigvec_mat, g, dg, para_env)
+
+      INTEGER, INTENT(IN)                                :: ndf
+      TYPE(cp_fm_type), INTENT(IN)                       :: eigvec_mat
+      REAL(KIND=dp), INTENT(IN)                          :: g(ndf)
+      REAL(KIND=dp), INTENT(OUT)                         :: dg(ndf)
+      TYPE(mp_para_env_type), OPTIONAL, POINTER          :: para_env
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'eigvec_gradient'
+
+      INTEGER                                            :: handle, i, j, k, l, ncol_local, &
+                                                            nrow_local
+      INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
+      REAL(KIND=dp), CONTIGUOUS, DIMENSION(:, :), &
+         POINTER                                         :: local_data
+
+      CALL timeset(routineN, handle)
+
+      dg = 0._dp
+
+      CALL cp_fm_get_info(eigvec_mat, row_indices=row_indices, col_indices=col_indices, &
+                          local_data=local_data, nrow_local=nrow_local, ncol_local=ncol_local)
+
+      DO i = 1, nrow_local
+         j = row_indices(i)
+         DO k = 1, ncol_local
+            l = col_indices(k)
+            dg(l) = dg(l) + local_data(i, k)*g(j)
+         END DO
+      END DO
+      CALL para_env%sum(dg)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE eigvec_gradient
+
+! **************************************************************************************************
+!> \brief Squared 2-norm of the shifted RFO step in the eigenvector basis and
+!>        its derivative: N(v) = sum_i f_i^2/(h_i - v)^2, N'(v) = 2 sum_i f_i^2/(h_i - v)^3.
+!>        N is increasing in v and N' > 0 for v < h_1.
+!> \param ndf Number of degrees of freedom
+!> \param dg Gradient components in the eigenvector basis
+!> \param eigval Hessian eigenvalues, ascending
+!> \param v Shift at which to evaluate
+!> \param n_val N(v)
+!> \param n_der N'(v)
+! **************************************************************************************************
+   SUBROUTINE rs_rfo_norm2(ndf, dg, eigval, v, n_val, n_der)
+
+      INTEGER, INTENT(IN)                                :: ndf
+      REAL(KIND=dp), INTENT(IN)                          :: dg(ndf), eigval(ndf), v
+      REAL(KIND=dp), INTENT(OUT)                         :: n_val, n_der
+
+      INTEGER                                            :: indf
+
+      n_val = 0.0_dp
+      n_der = 0.0_dp
+      DO indf = 1, ndf
+         n_val = n_val + dg(indf)**2/(eigval(indf) - v)**2
+         n_der = n_der + 2.0_dp*dg(indf)**2/(eigval(indf) - v)**3
+      END DO
+
+   END SUBROUTINE rs_rfo_norm2
+
+! **************************************************************************************************
+!> \brief Restricted-step shift: enlarge the RFO or Levenberg-Marquardt shift
+!>        until the step meets the trust radius (More-Sorensen psi iteration),
+!>        or keep the reference shift when the step is interior. Writes the
+!>        shifted spectrum into shifted_eigval so eigval stays intact.
+!> \param ndf Number of degrees of freedom
+!> \param dg Gradient components in the eigenvector basis (replicated)
+!> \param eigval Unshifted Hessian eigenvalues, ascending
+!> \param shifted_eigval Output shifted eigenvalues eigval - v
+!> \param shift Reference shift (RFO secular root or 0 for Levenberg-Marquardt)
+!> \param rad Trust radius; the step 2-norm is bounded by rad*sqrt(log10(ndf))
+!> \param output_unit Output unit for the restriction notice
+! **************************************************************************************************
+   SUBROUTINE rs_rfo_shift(ndf, dg, eigval, shifted_eigval, shift, rad, output_unit)
+
+      INTEGER, INTENT(IN)                                :: ndf
+      REAL(KIND=dp), INTENT(IN)                          :: dg(ndf), eigval(ndf)
+      REAL(KIND=dp), INTENT(OUT)                         :: shifted_eigval(ndf)
+      REAL(KIND=dp), INTENT(IN)                          :: shift, rad
+      INTEGER, INTENT(IN)                                :: output_unit
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'rs_rfo_shift'
+      INTEGER, PARAMETER                                 :: max_bisect_iter = 200, &
+                                                            max_newton_iter = 25
+      REAL(KIND=dp), PARAMETER                           :: accept_rel_tol = 1.0E-6_dp, &
+                                                            newton_rel_tol = 1.0E-8_dp, &
+                                                            one = 1.0_dp, zero = 0.0_dp
+
+      INTEGER                                            :: handle, indf, iter
+      REAL(KIND=dp)                                      :: fnorm, hi, lo, mid, n_der, n_val, r_eff, &
+                                                            v
+
+      CALL timeset(routineN, handle)
+
+      r_eff = rad*rs_rfo_scale(ndf)
+
+      v = shift
+      CALL rs_rfo_norm2(ndf, dg, eigval, v, n_val, n_der)
+
+      IF (n_val > r_eff**2) THEN
+         ! Newton on psi(v) = 1/sqrt(N(v)) - 1/r_eff: strictly concave and
+         ! decreasing, so the iterates march monotonically away from the pole.
+         DO iter = 1, max_newton_iter
+            v = v + 2.0_dp*(n_val - n_val**1.5_dp/r_eff)/n_der
+            IF (v >= eigval(1)) v = 0.5_dp*(v + eigval(1))
+            CALL rs_rfo_norm2(ndf, dg, eigval, v, n_val, n_der)
+            IF (ABS(SQRT(n_val) - r_eff) <= newton_rel_tol*r_eff) EXIT
+         END DO
+
+         IF (ABS(SQRT(n_val) - r_eff) > accept_rel_tol*r_eff) THEN
+            ! Bisection backstop on N(v) = r_eff^2.
+            fnorm = SQRT(DOT_PRODUCT(dg, dg))
+            lo = -(fnorm/r_eff + MAX(zero, -eigval(1)))*2.0_dp - one
+            CALL rs_rfo_norm2(ndf, dg, eigval, lo, n_val, n_der)
+            DO WHILE (n_val > r_eff**2)
+               lo = 2.0_dp*lo
+               CALL rs_rfo_norm2(ndf, dg, eigval, lo, n_val, n_der)
+            END DO
+            hi = shift
+            DO iter = 1, max_bisect_iter
+               mid = 0.5_dp*(lo + hi)
+               CALL rs_rfo_norm2(ndf, dg, eigval, mid, n_val, n_der)
+               IF (n_val > r_eff**2) THEN
+                  hi = mid
+               ELSE
+                  lo = mid
+               END IF
+            END DO
+            v = 0.5_dp*(lo + hi)
+            CALL rs_rfo_norm2(ndf, dg, eigval, v, n_val, n_der)
+         END IF
+
+         IF (ABS(SQRT(n_val) - r_eff) > accept_rel_tol*r_eff) THEN
+            v = shift
+            CPWARN("Shift solver failed, natural step kept")
+         END IF
+         IF (output_unit > 0) THEN
+            WRITE (UNIT=output_unit, FMT="(T2,A,F12.6)") &
+               " BFGS| Step restricted, 2-norm scaled to ", r_eff
+            CALL m_flush(output_unit)
+         END IF
+         CPASSERT(v <= shift)
+      END IF
+
+      DO indf = 1, ndf
+         shifted_eigval(indf) = eigval(indf) - v
+      END DO
+
+      CALL timestop(handle)
+
+   END SUBROUTINE rs_rfo_shift
+
+! **************************************************************************************************
+!> \brief Model descent of the restricted step at a given radius: bisect the
+!>        secular branch below the lowest eigenvalue for N(v) = r^2, then
+!>        evaluate pred = g.s + 1/2 s.Hs with s_i = -f_i/(h_i - v)
+!>        (the sign of geoopt_get_step). pred <= 0; |pred| grows with r.
+!> \param ndf Number of degrees of freedom
+!> \param dg Gradient components in the eigenvector basis
+!> \param eigval Hessian eigenvalues, ascending (unshifted)
+!> \param r Radius (2-norm) of the restricted step
+!> \return The model energy change along the step
+! **************************************************************************************************
+   FUNCTION restricted_descent(ndf, dg, eigval, r) RESULT(pred)
+
+      INTEGER, INTENT(IN)                                :: ndf
+      REAL(KIND=dp), INTENT(IN)                          :: dg(ndf), eigval(ndf), r
+      REAL(KIND=dp)                                      :: pred
+
+      INTEGER, PARAMETER                                 :: max_bisect_iter = 50, &
+                                                            max_bracket_iter = 200
+      REAL(KIND=dp), PARAMETER                           :: zero = 0.0_dp
+
+      INTEGER                                            :: indf, iter
+      REAL(KIND=dp)                                      :: fnorm2, hi, lo, mid, n_der, n_val, v
+
+      pred = zero
+      fnorm2 = DOT_PRODUCT(dg, dg)
+      IF (fnorm2 <= TINY(1.0_dp) .OR. r <= zero) RETURN
+
+      ! N(v) is increasing on (-inf, h_1), N -> inf at the pole and N -> 0 at
+      ! -inf: bracket from the left, then bisect.
+      lo = -(SQRT(fnorm2)/r + MAX(zero, -eigval(1)))*2.0_dp - 1.0_dp
+      CALL rs_rfo_norm2(ndf, dg, eigval, lo, n_val, n_der)
+      DO iter = 1, max_bracket_iter
+         IF (n_val <= r*r) EXIT
+         lo = 2.0_dp*lo
+         CALL rs_rfo_norm2(ndf, dg, eigval, lo, n_val, n_der)
+      END DO
+      hi = eigval(1)
+      DO iter = 1, max_bisect_iter
+         mid = 0.5_dp*(lo + hi)
+         CALL rs_rfo_norm2(ndf, dg, eigval, mid, n_val, n_der)
+         IF (n_val > r*r) THEN
+            hi = mid
+         ELSE
+            lo = mid
+         END IF
+      END DO
+      v = 0.5_dp*(lo + hi)
+
+      pred = zero
+      DO indf = 1, ndf
+         pred = pred - dg(indf)**2/(eigval(indf) - v) &
+                - 0.5_dp*eigval(indf)*dg(indf)**2/(eigval(indf) - v)**2
+      END DO
+
+   END FUNCTION restricted_descent
+
+! **************************************************************************************************
+!> \brief Amortization floor for a surface whose energy carries evaluation
+!>        discontinuities of size delhat (truncated SCF): a step is
+!>        informative only when its model descent reaches amort_kappa*delhat,
+!>        so the smallest radius meeting that bar is a lower bound on useful
+!>        step sizes. Raise the trust radius to that bound (capped): steps
+!>        below it cannot out-walk the discontinuity, they only sample it.
+!> \param ndf Number of degrees of freedom
+!> \param dg Gradient components in the eigenvector basis
+!> \param eigval Hessian eigenvalues, ascending (unshifted)
+!> \param delhat Estimated energy discontinuity (positive)
+!> \param rad Trust radius, possibly raised in place
+!> \param output_unit Output unit for the at-cap advisory
+!> \param active True while pinned at the cap (advisory printed once)
+! **************************************************************************************************
+   SUBROUTINE amort_floor(ndf, dg, eigval, delhat, rad, output_unit, active)
+
+      INTEGER, INTENT(IN)                                :: ndf
+      REAL(KIND=dp), INTENT(IN)                          :: dg(ndf), eigval(ndf), delhat
+      REAL(KIND=dp), INTENT(INOUT)                       :: rad
+      INTEGER, INTENT(IN)                                :: output_unit
+      LOGICAL, INTENT(INOUT)                             :: active
+
+      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'amort_floor'
+      INTEGER, PARAMETER                                 :: max_bisect_iter = 60
+
+      INTEGER                                            :: handle, iter
+      REAL(KIND=dp)                                      :: pred_cap, r_cap, r_hi, r_lo, r_mid, &
+                                                            r_min, r_upper, snorm_newton, TARGET
+
+      CALL timeset(routineN, handle)
+
+      r_cap = max_trust_radius*rs_rfo_scale(ndf)
+      r_upper = r_cap
+      IF (eigval(1) > min_hessian_eigenvalue) THEN
+         snorm_newton = 0.0_dp
+         DO iter = 1, ndf
+            snorm_newton = snorm_newton + (dg(iter)/eigval(iter))**2
+         END DO
+         r_upper = MIN(r_cap, SQRT(snorm_newton))
+      END IF
+      TARGET = amort_kappa*delhat
+      pred_cap = restricted_descent(ndf, dg, eigval, r_upper)
+
+      IF (ABS(pred_cap) < TARGET) THEN
+         r_min = r_upper
+         IF (.NOT. active .AND. output_unit > 0) THEN
+            WRITE (UNIT=output_unit, FMT="(T2,A,ES12.4,A,ES12.4,A)") &
+               " BFGS| Model descent at the radius cap (", pred_cap, &
+               ") cannot out-run the estimated energy discontinuity (", TARGET, &
+               "), amortizing large steps; consider a tighter EPS_SCF or a larger MAX_SCF"
+            CALL m_flush(output_unit)
+         END IF
+         active = .TRUE.
+      ELSE
+         active = .FALSE.
+         r_lo = 0.0_dp
+         r_hi = r_upper
+         DO iter = 1, max_bisect_iter
+            r_mid = 0.5_dp*(r_lo + r_hi)
+            IF (ABS(restricted_descent(ndf, dg, eigval, r_mid)) < TARGET) THEN
+               r_lo = r_mid
+            ELSE
+               r_hi = r_mid
+            END IF
+         END DO
+         r_min = r_hi
+      END IF
+
+      rad = MAX(rad, MIN(r_min/rs_rfo_scale(ndf), max_trust_radius))
+
+      CALL timestop(handle)
+
+   END SUBROUTINE amort_floor
+
+! **************************************************************************************************
 !> \brief Update the direct Hessian with the damped BFGS formula
 !> \param ndf Number of optimization variables
 !> \param dx Change of the optimization variables
@@ -1557,6 +2035,58 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE update_trust_rad
+
+! **************************************************************************************************
+!> \brief Trust-radius update after Schlegel, J. Comput. Chem. 32, 1857 (2011),
+!>        eq. (17): grow the radius only when the step used the whole region
+!>        and the model agreed, shrink it to a quarter of the step when the
+!>        model mispredicted.
+!> \param ndf Number of degrees of freedom
+!> \param rho Actual-to-predicted energy change ratio (0 for a degenerate model)
+!> \param snorm 2-norm of the accepted step
+!> \param rad Trust radius, updated in place
+!> \param rejected True when the previous step was rejected (freezes growth)
+!> \param output_unit Output unit for the floor notice
+! **************************************************************************************************
+   SUBROUTINE update_adaptive_trust_rad(ndf, rho, snorm, rad, rejected, output_unit)
+
+      INTEGER, INTENT(IN)                                :: ndf
+      REAL(KIND=dp), INTENT(IN)                          :: rho, snorm
+      REAL(KIND=dp), INTENT(INOUT)                       :: rad
+      LOGICAL, INTENT(IN)                                :: rejected
+      INTEGER, INTENT(IN)                                :: output_unit
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'update_adaptive_trust_rad'
+      REAL(KIND=dp), PARAMETER :: boundary_margin = 1.25_dp, grow_factor = 2.0_dp, &
+         rho_grow = 0.75_dp, rho_shrink = 0.25_dp, shrink_factor = 0.25_dp
+
+      INTEGER                                            :: handle
+      REAL(KIND=dp)                                      :: r_eff, rad_in
+
+      CALL timeset(routineN, handle)
+
+      ! rad is measured in scaled units: the step norm is bounded by
+      ! r_eff = rad*rs_rfo_scale(ndf). Compare the norm against r_eff, and
+      ! shrink so that the new r_eff is a quarter of the taken step.
+      rad_in = rad
+      r_eff = rad*rs_rfo_scale(ndf)
+      IF (rho > rho_grow .AND. boundary_margin*snorm > r_eff .AND. .NOT. rejected) THEN
+         rad = MIN(grow_factor*rad, max_trust_radius)
+      ELSE IF (rho < rho_shrink) THEN
+         rad = shrink_factor*snorm/rs_rfo_scale(ndf)
+      END IF
+      IF (rad < min_trust_radius) THEN
+         IF (rad_in > min_trust_radius .AND. output_unit > 0) THEN
+            WRITE (UNIT=output_unit, FMT="(T2,A,F12.6)") &
+               " BFGS| Trust radius at the adaptive floor ", min_trust_radius
+            CALL m_flush(output_unit)
+         END IF
+         rad = min_trust_radius
+      END IF
+      rad = MIN(rad, max_trust_radius)
+      CALL timestop(handle)
+
+   END SUBROUTINE update_adaptive_trust_rad
 
 ! **************************************************************************************************
 

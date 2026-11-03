@@ -1337,7 +1337,9 @@ CONTAINS
 
       CALL keyword_create(keyword, __LOCATION__, name="TRUST_RADIUS", &
                           description="Trust radius used in BFGS. Previously set to 0.1. "// &
-                          "Large values can lead to instabilities", &
+                          "Large values can lead to instabilities. With ADAPTIVE_TRUST_RADIUS "// &
+                          "the radius bounds the step 2-norm scaled by sqrt(log10(ndf)); "// &
+                          "otherwise it bounds the largest step component.", &
                           usage="TRUST_RADIUS {real}", unit_str='angstrom', &
                           default_r_val=cp_unit_to_cp2k(0.25_dp, "angstrom"))
       CALL section_add_keyword(section, keyword)
@@ -1357,6 +1359,18 @@ CONTAINS
                           "Previously default but did not improve convergence in many cases. "// &
                           "Not supported by inverse-Hessian update method.", &
                           usage="USE_RAT_FUN_OPT", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="ADAPTIVE_TRUST_RADIUS", &
+                          description="Restricts the optimization step to the trust radius in "// &
+                          "the scaled 2-norm and adapts the radius to the agreement between "// &
+                          "the predicted and the true energy change, with rejection of uphill "// &
+                          "steps. OFF uses the largest-component clip and a fixed radius. "// &
+                          "Cannot be combined with USE_RAT_FUN_OPT, which uses its own step "// &
+                          "and trust-radius heuristic.", &
+                          usage="ADAPTIVE_TRUST_RADIUS", &
                           default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
