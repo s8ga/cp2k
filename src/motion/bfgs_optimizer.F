@@ -72,6 +72,7 @@ MODULE bfgs_optimizer
                                               section_vals_val_set
    USE iso_fortran_env,                 ONLY: iostat_end
    USE kinds,                           ONLY: default_path_length,&
+                                              default_string_length,&
                                               dp
    USE machine,                         ONLY: m_flush,&
                                               m_walltime
@@ -80,6 +81,7 @@ MODULE bfgs_optimizer
    USE message_passing,                 ONLY: mp_para_env_type
    USE parallel_gemm_api,               ONLY: parallel_gemm
    USE particle_list_types,             ONLY: particle_list_type
+   USE string_utilities,                ONLY: uppercase
 #include "../base/base_uses.f90"
 
    IMPLICIT NONE
@@ -109,6 +111,7 @@ MODULE bfgs_optimizer
    REAL(KIND=dp), PARAMETER             :: max_trust_radius = 1.0_dp
    REAL(KIND=dp), PARAMETER             :: min_hessian_eigenvalue = 1.0e-4_dp
    REAL(KIND=dp), PARAMETER             :: min_trust_radius = 1.0e-3_dp
+   LOGICAL, SAVE                        :: ablate_no_scale = .FALSE.
 
    PUBLIC :: bfgs_read_restart_header, geoopt_bfgs
 
@@ -143,13 +146,15 @@ CONTAINS
          spgr_norm_tol = 1.0E-6_dp, zero = 0.0_dp
 
       CHARACTER(LEN=5)                                   :: wildcard
+      CHARACTER(LEN=default_string_length)               :: ablate_env, ablate_tok
       INTEGER                                            :: handle, info, iter_nr, its, &
                                                             matrix_method, maxiter, n_rej, ndf, &
-                                                            output_unit
-      LOGICAL :: adaptive_explicit, adaptive_tr, capped_explicit, capped_step_conv, conv, &
-         delhat_resolved, floor_active, grad_conv, hesrest, hess_reset, inverse, &
-         secant_consistent, shell_present, should_stop, step_rejected, use_mod_hes, &
-         use_primal_damping, use_rfo
+                                                            output_unit, p_comma, p_start
+      LOGICAL :: ablate_no_m2_lm, ablate_no_m3_reject, ablate_no_m4_rej_upd, ablate_no_m5_skip, &
+         ablate_no_m6_primal, ablate_no_m7a_delhat, ablate_no_m7b_amort, adaptive_explicit, &
+         adaptive_tr, capped_explicit, capped_step_conv, conv, delhat_resolved, floor_active, &
+         grad_conv, hesrest, hess_reset, inverse, secant_consistent, shell_present, should_stop, &
+         step_rejected, use_mod_hes, use_primal_damping, use_rfo
       REAL(KIND=dp) :: alpha_inv, delhat, delhat_eff, dres, ediff, eig_floor, emin, eold, etot, &
          ln_shift, pred, pred_floor, r_eff, rad, rad_shrunk, rat, rho, snorm, step, t_diff, t_now, &
          t_old
@@ -225,9 +230,68 @@ CONTAINS
                           "BFGS TRUST_RADIUS must be finite and positive")
          END IF
       END IF
+      ablate_env = ""
+      IF (para_env%is_source()) THEN
+         CALL GET_ENVIRONMENT_VARIABLE("CP2K_BFGS_ABLATE", ablate_env)
+         CALL uppercase(ablate_env)
+      END IF
+      CALL para_env%bcast(ablate_env, para_env%source)
+      ablate_no_scale = .FALSE.
+      ablate_no_m2_lm = .FALSE.
+      ablate_no_m3_reject = .FALSE.
+      ablate_no_m4_rej_upd = .FALSE.
+      ablate_no_m5_skip = .FALSE.
+      ablate_no_m6_primal = .FALSE.
+      ablate_no_m7a_delhat = .FALSE.
+      ablate_no_m7b_amort = .FALSE.
+      IF (LEN_TRIM(ablate_env) > 0) THEN
+         p_start = 1
+         DO WHILE (p_start <= LEN_TRIM(ablate_env))
+            p_comma = INDEX(ablate_env(p_start:), ",")
+            IF (p_comma == 0) THEN
+               ablate_tok = ADJUSTL(ablate_env(p_start:))
+               p_start = LEN_TRIM(ablate_env) + 1
+            ELSE
+               ablate_tok = ADJUSTL(ablate_env(p_start:p_start + p_comma - 2))
+               p_start = p_start + p_comma
+            END IF
+            SELECT CASE (TRIM(ablate_tok))
+            CASE ("", "FULL", "NONE")
+               ! Default PR 3 behavior (all modules enabled)
+            CASE ("LEGACY")
+               adaptive_tr = .FALSE.
+               capped_step_conv = .FALSE.
+            CASE ("NO_M1_CAP")
+               capped_step_conv = .FALSE.
+            CASE ("NO_M2_LM")
+               ablate_no_m2_lm = .TRUE.
+            CASE ("NO_SCALE")
+               ablate_no_scale = .TRUE.
+            CASE ("NO_M3_REJECT")
+               ablate_no_m3_reject = .TRUE.
+            CASE ("NO_M4_REJ_UPD")
+               ablate_no_m4_rej_upd = .TRUE.
+            CASE ("NO_M5_SKIP")
+               ablate_no_m5_skip = .TRUE.
+            CASE ("NO_M6_PRIMAL")
+               ablate_no_m6_primal = .TRUE.
+            CASE ("NO_M7A_DELHAT")
+               ablate_no_m7a_delhat = .TRUE.
+            CASE ("NO_M7B_AMORT")
+               ablate_no_m7b_amort = .TRUE.
+            CASE DEFAULT
+               CALL cp_abort(__LOCATION__, &
+                             "Unknown CP2K_BFGS_ABLATE token: "//TRIM(ablate_tok))
+            END SELECT
+         END DO
+      END IF
       output_unit = cp_print_key_unit_nr(logger, geo_section, "PRINT%PROGRAM_RUN_INFO", &
                                          extension=".geoLog")
       IF (output_unit > 0) THEN
+         IF (LEN_TRIM(ablate_env) > 0) THEN
+            WRITE (UNIT=output_unit, FMT="(/,T2,A,A)") &
+               "BFGS| Ablation override (CP2K_BFGS_ABLATE): ", TRIM(ADJUSTL(ablate_env))
+         END IF
          IF (inverse) THEN
             WRITE (UNIT=output_unit, FMT="(/,T2,A)") "BFGS| Matrix update method: INVERSE"
          ELSE
@@ -395,7 +459,7 @@ CONTAINS
          ! Skip the secant update when the previous step crossed an SCF
          ! discontinuity or noise floor where energy and forces disagree.
          secant_consistent = .TRUE.
-         IF (adaptive_tr) THEN
+         IF (adaptive_tr .AND. .NOT. ablate_no_m5_skip) THEN
             secant_consistent = ABS(dres) <= MAX(del_min, cubic_tol*snorm**3)
          END IF
          IF ((its - iter_nr) > 1 .AND. .NOT. step_rejected .AND. secant_consistent) THEN
@@ -408,7 +472,7 @@ CONTAINS
             dg(:) = g(:) - gold(:)
             IF (inverse) THEN
                use_primal_damping = .FALSE.
-               IF (adaptive_tr) THEN
+               IF (adaptive_tr .AND. .NOT. ablate_no_m6_primal) THEN
                   use_primal_damping = MAXVAL(ABS(dx(:) - s_raw(:))) <= &
                      primal_step_tol*MAX(MAXVAL(ABS(dx(:))), TINY(one))
                END IF
@@ -468,7 +532,7 @@ CONTAINS
             ! Amortization floor: once an energy discontinuity is resolved, raise
             ! the radius to the smallest one whose model descent out-runs it,
             ! except on a rejection retry or once forces already satisfy tolerances.
-            IF (adaptive_tr .AND. delhat_resolved .AND. &
+            IF (adaptive_tr .AND. delhat_resolved .AND. .NOT. ablate_no_m7b_amort .AND. &
                 .NOT. step_rejected .AND. .NOT. grad_conv) THEN
                CALL eigvec_gradient(ndf, eigvec_mat, g, dg, para_env)
                CALL amort_floor(ndf, dg, eigval, delhat, rad, output_unit, floor_active)
@@ -479,7 +543,7 @@ CONTAINS
                dx(:) = eigval
                CALL rat_fun_opt(ndf, dg, eigval, work, eigvec_mat, g, para_env)
                CALL geoopt_get_step(ndf, eigval, eigvec_mat, hess_tmp, dr, g, para_env, .TRUE.)
-            ELSE IF (adaptive_tr) THEN
+            ELSE IF (adaptive_tr .AND. .NOT. ablate_no_m2_lm) THEN
                ! Levenberg-Marquardt step into work(:), preserving eigval(:) for
                ! CAPPED_STEP_CONVERGENCE. A spectrum with nonpositive eigenvalues
                ! has no interior reference; start left of the lowest pole instead.
@@ -498,7 +562,8 @@ CONTAINS
          IF (inverse) THEN
             IF (adaptive_tr) THEN
                snorm = NORM2(dr)
-               IF (delhat_resolved .AND. .NOT. step_rejected .AND. .NOT. grad_conv) THEN
+               IF (delhat_resolved .AND. .NOT. ablate_no_m7b_amort .AND. &
+                   .NOT. step_rejected .AND. .NOT. grad_conv) THEN
                   CALL amort_floor_inverse(ndf, 0.5_dp*DOT_PRODUCT(gold(1:ndf), dr(1:ndf)), &
                                            snorm, delhat, rad, output_unit, floor_active)
                END IF
@@ -528,12 +593,14 @@ CONTAINS
          ELSE IF (adaptive_tr) THEN
             step = MAXVAL(ABS(dr))
             snorm = NORM2(dr)
-            ! Space-group symmetrization may enlarge the step beyond the
-            ! region the restricted solve guaranteed.
+            ! Space-group symmetrization (or ablated M2 ray-clipping) may leave
+            ! the step beyond the region the restricted solve guaranteed.
             r_eff = rad*rs_rfo_scale(ndf)
-            IF (gopt_env%spgr%keep_space_group .AND. snorm > r_eff*(one + spgr_norm_tol)) THEN
+            IF ((ablate_no_m2_lm .AND. snorm > r_eff) .OR. &
+                (gopt_env%spgr%keep_space_group .AND. snorm > r_eff*(one + spgr_norm_tol))) THEN
                dr(:) = dr(:)*(r_eff/snorm)
                snorm = r_eff
+               step = MAXVAL(ABS(dr))
             END IF
          ELSE
             CALL trust_radius(ndf, step, rad, rat, dr, output_unit)
@@ -581,16 +648,18 @@ CONTAINS
             ! the O(|s|^3) trapezoid error cannot mask the signal.
             dres = ediff - 0.5_dp*(DOT_PRODUCT(gold(1:ndf), dr(1:ndf)) + &
                                    DOT_PRODUCT(g(1:ndf), dr(1:ndf)))
-            delhat = decay_del*delhat
-            IF (snorm > min_step_sample .AND. snorm <= s_small .AND. &
-                ABS(dres) >= MAX(del_min, cubic_tol*snorm**3)) THEN
-               delhat = MAX(delhat, ABS(dres))
-               IF (.NOT. delhat_resolved) THEN
-                  delhat_resolved = .TRUE.
-                  IF (output_unit > 0) THEN
-                     WRITE (UNIT=output_unit, FMT="(T2,A,ES12.4)") &
-                        " BFGS| Energy discontinuity of the surface estimated at ", delhat
-                     CALL m_flush(output_unit)
+            IF (.NOT. ablate_no_m7a_delhat) THEN
+               delhat = decay_del*delhat
+               IF (snorm > min_step_sample .AND. snorm <= s_small .AND. &
+                   ABS(dres) >= MAX(del_min, cubic_tol*snorm**3)) THEN
+                  delhat = MAX(delhat, ABS(dres))
+                  IF (.NOT. delhat_resolved) THEN
+                     delhat_resolved = .TRUE.
+                     IF (output_unit > 0) THEN
+                        WRITE (UNIT=output_unit, FMT="(T2,A,ES12.4)") &
+                           " BFGS| Energy discontinuity of the surface estimated at ", delhat
+                        CALL m_flush(output_unit)
+                     END IF
                   END IF
                END IF
             END IF
@@ -658,7 +727,7 @@ CONTAINS
          ! Reject a step that raised the energy: roll back to the stored
          ! anchors and re-solve with the shrunk radius on the next pass
          ! (no new force evaluation; the Hessian update is skipped).
-         IF (adaptive_tr .AND. ediff > kappa_rej*delhat_eff) THEN
+         IF (adaptive_tr .AND. .NOT. ablate_no_m3_reject .AND. ediff > kappa_rej*delhat_eff) THEN
             rad_shrunk = MAX(shrink_factor*snorm/rs_rfo_scale(ndf), min_trust_radius)
             IF (n_rej < max_step_rejections .AND. rad_shrunk < rad) THEN
                ! The excursion carries curvature information: ediff > 0 with
@@ -666,14 +735,15 @@ CONTAINS
                ! up to O(|s|^3) - provided the energy and the forces agree.
                ! Across an SCF-truncation cliff they do not, so feed the pair
                ! only where the consistency residual stays small.
-               IF (DOT_PRODUCT(gold(1:ndf), dr(1:ndf)) < 0.0_dp .AND. &
+               IF (.NOT. ablate_no_m4_rej_upd .AND. &
+                   DOT_PRODUCT(gold(1:ndf), dr(1:ndf)) < 0.0_dp .AND. &
                    DOT_PRODUCT(g(1:ndf), dr(1:ndf)) > DOT_PRODUCT(gold(1:ndf), dr(1:ndf)) .AND. &
                    (delhat_eff <= 0.0_dp .OR. ABS(dres) <= kappa_cons*delhat_eff)) THEN
                   dx(1:ndf) = dr(1:ndf)
                   dg(1:ndf) = g(1:ndf) - gold(1:ndf)
                   IF (inverse) THEN
                      use_primal_damping = .FALSE.
-                     IF (adaptive_tr) THEN
+                     IF (adaptive_tr .AND. .NOT. ablate_no_m6_primal) THEN
                         use_primal_damping = MAXVAL(ABS(dx(:) - s_raw(:))) <= &
                            primal_step_tol*MAX(MAXVAL(ABS(dx(:))), TINY(one))
                      END IF
@@ -1344,7 +1414,11 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: ndf
       REAL(KIND=dp)                                      :: scale
 
-      scale = SQRT(MAX(1.0_dp, LOG10(REAL(ndf, KIND=dp))))
+      IF (ablate_no_scale) THEN
+         scale = 1.0_dp
+      ELSE
+         scale = SQRT(MAX(1.0_dp, LOG10(REAL(ndf, KIND=dp))))
+      END IF
 
    END FUNCTION rs_rfo_scale
 
