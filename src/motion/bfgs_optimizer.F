@@ -138,8 +138,9 @@ CONTAINS
       INTEGER, PARAMETER                                 :: max_step_rejections = 3
       REAL(KIND=dp), PARAMETER :: cubic_tol = 50.0_dp, decay_del = 0.958_dp, del_min = 1.0E-5_dp, &
          kappa_cons = 0.5_dp, kappa_rej = 1.5_dp, min_step_sample = 1.0E-9_dp, one = 1.0_dp, &
-         pred_abs_floor = 1.0E-12_dp, pred_rel_floor = 1.0E-10_dp, rfo_pole_offset = 0.01_dp, &
-         s_small = 0.02_dp, shrink_factor = 0.25_dp, spgr_norm_tol = 1.0E-6_dp, zero = 0.0_dp
+         pred_abs_floor = 1.0E-12_dp, pred_rel_floor = 1.0E-10_dp, primal_step_tol = 1.0E-10_dp, &
+         rfo_pole_offset = 0.01_dp, s_small = 0.02_dp, shrink_factor = 0.25_dp, &
+         spgr_norm_tol = 1.0E-6_dp, zero = 0.0_dp
 
       CHARACTER(LEN=5)                                   :: wildcard
       INTEGER                                            :: handle, info, iter_nr, its, &
@@ -147,10 +148,13 @@ CONTAINS
                                                             output_unit
       LOGICAL :: adaptive_explicit, adaptive_tr, capped_explicit, capped_step_conv, conv, &
          delhat_resolved, floor_active, grad_conv, hesrest, hess_reset, inverse, &
-         secant_consistent, shell_present, should_stop, step_rejected, use_mod_hes, use_rfo
-      REAL(KIND=dp) :: delhat, delhat_eff, dres, ediff, eig_floor, emin, eold, etot, ln_shift, &
-         pred, pred_floor, r_eff, rad, rad_shrunk, rat, rho, snorm, step, t_diff, t_now, t_old
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: dg, dr, dx, eigval, gold, work, xold
+         secant_consistent, shell_present, should_stop, step_rejected, use_mod_hes, &
+         use_primal_damping, use_rfo
+      REAL(KIND=dp) :: alpha_inv, delhat, delhat_eff, dres, ediff, eig_floor, emin, eold, etot, &
+         ln_shift, pred, pred_floor, r_eff, rad, rad_shrunk, rat, rho, snorm, step, t_diff, t_now, &
+         t_old
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: b_dx, dg, dr, dx, eigval, gold, s_raw, &
+                                                            work, xold
       REAL(KIND=dp), DIMENSION(:), POINTER               :: g
       TYPE(atomic_kind_list_type), POINTER               :: atomic_kinds
       TYPE(cp_blacs_env_type), POINTER                   :: blacs_env
@@ -215,7 +219,6 @@ CONTAINS
          END IF
          adaptive_tr = .FALSE.
       END IF
-      IF (inverse) adaptive_tr = .FALSE.
       IF (inverse .OR. adaptive_tr) THEN
          IF (.NOT. ieee_is_finite(rad) .OR. rad <= 0.0_dp) THEN
             CALL cp_abort(__LOCATION__, &
@@ -349,6 +352,11 @@ CONTAINS
 
       ALLOCATE (dr(ndf))
       dr(:) = 0.0_dp
+      IF (inverse .AND. adaptive_tr) THEN
+         ALLOCATE (b_dx(ndf), s_raw(ndf))
+         b_dx(:) = 0.0_dp
+         s_raw(:) = 0.0_dp
+      END IF
 
       ! find space_group
       CALL gopt_f_space_group_init(gopt_env, x0, geo_section, output_unit)
@@ -373,6 +381,7 @@ CONTAINS
       CALL gopt_f_io_init(gopt_env, output_unit, etot, wildcard=wildcard, its=iter_nr, used_time=t_diff)
       step_rejected = .FALSE.
       n_rej = 0
+      alpha_inv = one
       delhat = 0.0_dp
       dres = 0.0_dp
       snorm = 0.0_dp
@@ -398,7 +407,17 @@ CONTAINS
             dx(:) = x0(:) - xold(:)
             dg(:) = g(:) - gold(:)
             IF (inverse) THEN
-               CALL bfgs_inverse_update(ndf, dx, dg, hess_mat, work)
+               use_primal_damping = .FALSE.
+               IF (adaptive_tr) THEN
+                  use_primal_damping = MAXVAL(ABS(dx(:) - s_raw(:))) <= &
+                     primal_step_tol*MAX(MAXVAL(ABS(dx(:))), TINY(one))
+               END IF
+               IF (use_primal_damping) THEN
+                  CALL bfgs_inverse_update(ndf, dx, dg, hess_mat, work, b_dx=b_dx, &
+                                           output_unit=output_unit)
+               ELSE
+                  CALL bfgs_inverse_update(ndf, dx, dg, hess_mat, work)
+               END IF
             ELSE
                CALL bfgs(ndf, dx, dg, hess_mat, work, para_env, output_unit, hess_reset)
                IF (hess_reset) THEN
@@ -428,6 +447,7 @@ CONTAINS
 
          IF (inverse) THEN
             CALL bfgs_inverse_step(hess_mat, g, dr)
+            IF (adaptive_tr) s_raw(:) = dr(:)
          ELSE
             ! Copying hessian hes to (ndf x ndf) matrix hes_mat for diagonalization
             CALL cp_fm_to_fm(hess_mat, hess_tmp)
@@ -476,13 +496,34 @@ CONTAINS
          CALL gopt_f_project_step(gopt_env, dr)
 
          IF (inverse) THEN
-            ! Avoid a zero-step division and initialize the reported scale on every step.
-            rat = 1.0_dp
-            step = MAXVAL(ABS(dr))
-            IF (step > rad) THEN
-               rat = rad/step
-               dr(:) = rat*dr(:)
-               step = rad
+            IF (adaptive_tr) THEN
+               snorm = NORM2(dr)
+               IF (delhat_resolved .AND. .NOT. step_rejected .AND. .NOT. grad_conv) THEN
+                  CALL amort_floor_inverse(ndf, 0.5_dp*DOT_PRODUCT(gold(1:ndf), dr(1:ndf)), &
+                                           snorm, delhat, rad, output_unit, floor_active)
+               END IF
+               r_eff = rad*rs_rfo_scale(ndf)
+               alpha_inv = one
+               IF (snorm > r_eff) THEN
+                  alpha_inv = r_eff/snorm
+                  dr(:) = alpha_inv*dr(:)
+                  snorm = r_eff
+               END IF
+               ! Record the unprojected step and B*s = -alpha*g for primal
+               ! Powell damping via Sherman-Morrison-Woodbury on the next pass.
+               s_raw(:) = alpha_inv*s_raw(:)
+               b_dx(:) = -alpha_inv*gold(:)
+               rat = alpha_inv
+               step = MAXVAL(ABS(dr))
+            ELSE
+               ! Avoid a zero-step division and initialize the reported scale on every step.
+               rat = 1.0_dp
+               step = MAXVAL(ABS(dr))
+               IF (step > rad) THEN
+                  rat = rad/step
+                  dr(:) = rat*dr(:)
+                  step = rad
+               END IF
             END IF
          ELSE IF (adaptive_tr) THEN
             step = MAXVAL(ABS(dr))
@@ -514,8 +555,14 @@ CONTAINS
          dr(:) = x0(:) - xold(:)
          step = MAXVAL(ABS(dr))
 
-         ! This diagnostic requires B, not H. It is optional in gopt_f_io.
-         IF (.NOT. inverse) CALL energy_predict(ndf, work, hess_mat, dr, gold, pred, para_env)
+         IF (.NOT. inverse) THEN
+            CALL energy_predict(ndf, work, hess_mat, dr, gold, pred, para_env)
+         ELSE IF (adaptive_tr) THEN
+            ! Along the ray dr = alpha_inv*(-H*gold), s.B.s = -alpha_inv*gold.dr,
+            ! giving the exact quadratic model change without forming B.
+            snorm = NORM2(dr)
+            pred = (one - 0.5_dp*alpha_inv)*DOT_PRODUCT(gold(1:ndf), dr(1:ndf))
+         END IF
 
          ediff = etot - eold
 
@@ -563,9 +610,15 @@ CONTAINS
          t_diff = t_now - t_old
          t_old = t_now
          IF (inverse) THEN
-            CALL gopt_f_io(gopt_env, force_env, root_section, its, etot, output_unit, &
-                           eold, emin, wildcard, gopt_param, ndf, dr, g, conv, &
-                           rat=rat, step=step, rad=rad, used_time=t_diff)
+            IF (adaptive_tr) THEN
+               CALL gopt_f_io(gopt_env, force_env, root_section, its, etot, output_unit, &
+                              eold, emin, wildcard, gopt_param, ndf, dr, g, conv, pred=pred, &
+                              rat=rat, step=step, rad=rad, used_time=t_diff)
+            ELSE
+               CALL gopt_f_io(gopt_env, force_env, root_section, its, etot, output_unit, &
+                              eold, emin, wildcard, gopt_param, ndf, dr, g, conv, &
+                              rat=rat, step=step, rad=rad, used_time=t_diff)
+            END IF
          ELSE
             ! On a soft collective mode the raw Newton step grows as the inverse
             ! curvature, so the displacement criterion demands force precision
@@ -618,10 +671,24 @@ CONTAINS
                    (delhat_eff <= 0.0_dp .OR. ABS(dres) <= kappa_cons*delhat_eff)) THEN
                   dx(1:ndf) = dr(1:ndf)
                   dg(1:ndf) = g(1:ndf) - gold(1:ndf)
-                  CALL bfgs(ndf, dx, dg, hess_mat, work, para_env, output_unit, hess_reset)
-                  IF (hess_reset) THEN
-                     CALL build_initial_hess(hess_mat, hess_tmp, eigvec_mat, eigval, force_env, &
-                                             use_mod_hes, .FALSE.)
+                  IF (inverse) THEN
+                     use_primal_damping = .FALSE.
+                     IF (adaptive_tr) THEN
+                        use_primal_damping = MAXVAL(ABS(dx(:) - s_raw(:))) <= &
+                           primal_step_tol*MAX(MAXVAL(ABS(dx(:))), TINY(one))
+                     END IF
+                     IF (use_primal_damping) THEN
+                        CALL bfgs_inverse_update(ndf, dx, dg, hess_mat, work, b_dx=b_dx, &
+                                                 output_unit=output_unit)
+                     ELSE
+                        CALL bfgs_inverse_update(ndf, dx, dg, hess_mat, work)
+                     END IF
+                  ELSE
+                     CALL bfgs(ndf, dx, dg, hess_mat, work, para_env, output_unit, hess_reset)
+                     IF (hess_reset) THEN
+                        CALL build_initial_hess(hess_mat, hess_tmp, eigvec_mat, eigval, force_env, &
+                                                use_mod_hes, .FALSE.)
+                     END IF
                   END IF
                END IF
                x0 = xold
@@ -685,6 +752,8 @@ CONTAINS
       IF (ALLOCATED(eigval)) DEALLOCATE (eigval)
       DEALLOCATE (work)
       DEALLOCATE (dr)
+      IF (ALLOCATED(b_dx)) DEALLOCATE (b_dx)
+      IF (ALLOCATED(s_raw)) DEALLOCATE (s_raw)
 
       CALL cp_print_key_finished_output(output_unit, logger, geo_section, &
                                         "PRINT%PROGRAM_RUN_INFO")
@@ -699,18 +768,24 @@ CONTAINS
 !> \param dg Change of gradients in the same coordinate system
 !> \param hess_mat Inverse Hessian, updated in place
 !> \param work Replicated workspace for H*dg
+!> \param b_dx Optional direct Hessian action B*dx; when present, applies
+!>             primal Powell damping via Sherman-Morrison-Woodbury
+!> \param output_unit Optional geometry log unit for damping diagnostics
 ! **************************************************************************************************
-   SUBROUTINE bfgs_inverse_update(ndf, dx, dg, hess_mat, work)
+   SUBROUTINE bfgs_inverse_update(ndf, dx, dg, hess_mat, work, b_dx, output_unit)
       INTEGER, INTENT(IN)                                :: ndf
       REAL(KIND=dp), INTENT(IN)                          :: dx(ndf), dg(ndf)
       TYPE(cp_fm_type), INTENT(IN)                       :: hess_mat
       REAL(KIND=dp), INTENT(OUT)                         :: work(ndf)
+      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: b_dx(ndf)
+      INTEGER, INTENT(IN), OPTIONAL                      :: output_unit
 
-      REAL(KIND=dp), PARAMETER                           :: min_curvature = 0.2_dp
+      REAL(KIND=dp), PARAMETER                           :: min_curvature = 0.2_dp, &
+                                                            min_sbs = 10.0_dp*TINY(1.0_dp)
 
       INTEGER                                            :: handle, i, ig, invalid, j, jg, nc, nr
       INTEGER, DIMENSION(:), POINTER                     :: cols, rows
-      REAL(KIND=dp)                                      :: coeff, rho, sy, theta, yhy
+      REAL(KIND=dp)                                      :: coeff, rho, sbs, sy, theta, yhy
       REAL(KIND=dp), CONTIGUOUS, DIMENSION(:, :), &
          POINTER                                         :: data
       REAL(KIND=dp), DIMENSION(ndf)                      :: secant
@@ -718,6 +793,11 @@ CONTAINS
       CALL timeset("bfgs_inverse_update", handle)
       IF (.NOT. ALL(ieee_is_finite(dx)) .OR. .NOT. ALL(ieee_is_finite(dg))) THEN
          CPABORT("Non-finite displacement or gradient difference in inverse BFGS")
+      END IF
+      IF (PRESENT(b_dx)) THEN
+         IF (.NOT. ALL(ieee_is_finite(b_dx))) THEN
+            CPABORT("Non-finite curvature vector in inverse BFGS")
+         END IF
       END IF
       work = 0.0_dp
       IF (NORM2(dx) == 0.0_dp .OR. NORM2(dg) == 0.0_dp) THEN
@@ -740,7 +820,31 @@ CONTAINS
       END IF
 
       secant = dx
-      IF (sy < min_curvature*yhy) THEN
+      IF (PRESENT(b_dx)) THEN
+         ! Primal Powell damping in inverse form: with H*b_dx = dx, replacing y
+         ! by eta = theta*y + (1-theta)*B*s maps H*eta = theta*H*y + (1-theta)*dx
+         ! without forming B, yielding the exact inverse of the DIRECT update.
+         sbs = DOT_PRODUCT(dx, b_dx)
+         IF (.NOT. ieee_is_finite(sbs) .OR. sbs <= MAX(EPSILON(1.0_dp)*ABS(sy), min_sbs)) THEN
+            CALL cp_warn(__LOCATION__, &
+                         "BFGS: vanishing or non-positive predicted curvature; resetting to unity.")
+            CALL cp_fm_set_all(hess_mat, alpha=0.0_dp, beta=1.0_dp)
+            CALL timestop(handle)
+            RETURN
+         END IF
+         IF (sy < min_curvature*sbs) THEN
+            theta = ((1.0_dp - min_curvature)*sbs)/(sbs - sy)
+            IF (PRESENT(output_unit)) THEN
+               IF (output_unit > 0) THEN
+                  WRITE (UNIT=output_unit, FMT="(T2,A,ES12.4,A,ES12.4,A,F6.3)") &
+                     " BFGS| Damped update: s.y = ", sy, ", s.B.s = ", sbs, ", theta = ", theta
+               END IF
+            END IF
+            work = theta*work + (1.0_dp - theta)*dx
+            sy = theta*sy + (1.0_dp - theta)*sbs
+            yhy = theta*DOT_PRODUCT(dg, work) + (1.0_dp - theta)*DOT_PRODUCT(b_dx, work)
+         END IF
+      ELSE IF (sy < min_curvature*yhy) THEN
          ! Dual-space damping: y^T*s_tilde >= min_curvature*y^T*H*y.
          ! Unlike damping y with B*s, this does not need the direct Hessian.
          theta = ((1.0_dp - min_curvature)*yhy)/(yhy - sy)
@@ -1539,6 +1643,63 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE amort_floor
+
+! **************************************************************************************************
+!> \brief Ray counterpart of amort_floor for METHOD INVERSE: along s(alpha) = alpha*d,
+!>        the quadratic model change is (2*alpha - alpha**2)*m1, invertible in closed form.
+!> \param ndf Number of degrees of freedom
+!> \param m1 Full-step model change 0.5*g.d (< 0 on descent)
+!> \param snorm_raw 2-norm of the unclipped direction d
+!> \param delhat Estimated energy discontinuity (> 0)
+!> \param rad Trust radius, raised in place if below the amortization floor
+!> \param output_unit Output unit for the at-cap advisory
+!> \param active True while pinned at the cap (advisory printed once)
+! **************************************************************************************************
+   SUBROUTINE amort_floor_inverse(ndf, m1, snorm_raw, delhat, rad, output_unit, active)
+
+      INTEGER, INTENT(IN)                                :: ndf
+      REAL(KIND=dp), INTENT(IN)                          :: m1, snorm_raw, delhat
+      REAL(KIND=dp), INTENT(INOUT)                       :: rad
+      INTEGER, INTENT(IN)                                :: output_unit
+      LOGICAL, INTENT(INOUT)                             :: active
+
+      CHARACTER(LEN=*), PARAMETER :: routineN = 'amort_floor_inverse'
+
+      INTEGER                                            :: handle
+      REAL(KIND=dp)                                      :: alpha_cap, alpha_min, pred_cap, r_cap, &
+                                                            r_min, r_upper, TARGET
+
+      CALL timeset(routineN, handle)
+
+      r_cap = max_trust_radius*rs_rfo_scale(ndf)
+      r_upper = MIN(r_cap, snorm_raw)
+      TARGET = amort_kappa*delhat
+      alpha_cap = 1.0_dp
+      IF (snorm_raw > r_cap) alpha_cap = r_cap/snorm_raw
+      pred_cap = 0.0_dp
+      IF (m1 < 0.0_dp) pred_cap = (2.0_dp*alpha_cap - alpha_cap*alpha_cap)*m1
+
+      IF (ABS(pred_cap) < TARGET) THEN
+         r_min = r_upper
+         IF (.NOT. active .AND. output_unit > 0) THEN
+            WRITE (UNIT=output_unit, FMT="(T2,A,ES12.4,A,ES12.4,A)") &
+               " BFGS| Model descent at the radius cap (", pred_cap, &
+               ") cannot out-run the estimated energy discontinuity (", TARGET, &
+               "), amortizing large steps; consider a tighter EPS_SCF or a larger MAX_SCF"
+            CALL m_flush(output_unit)
+         END IF
+         active = .TRUE.
+      ELSE
+         active = .FALSE.
+         alpha_min = 1.0_dp - SQRT(MAX(0.0_dp, 1.0_dp - TARGET/ABS(m1)))
+         r_min = alpha_min*snorm_raw
+      END IF
+
+      rad = MAX(rad, MIN(r_min/rs_rfo_scale(ndf), max_trust_radius))
+
+      CALL timestop(handle)
+
+   END SUBROUTINE amort_floor_inverse
 
 ! **************************************************************************************************
 !> \brief Update the direct Hessian with the damped BFGS formula

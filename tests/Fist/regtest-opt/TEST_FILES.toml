@@ -113,4 +113,7 @@
 "cell_opt_bfgs_inverse_vib.inp"                = [{matcher = "M018", tol = 1.0E-14, ref = 587.912968}]
 # Curvature-capped model step convergence on a soft potential
 "geo_opt_bfgs_capped.inp"                      = [{matcher = "M011", tol = 1.0E-10, ref = -0.077916853281941}]
+# Adaptive trust-radius control on a stiff/nonconvex Gaussian well
+"geo_opt_bfgs_adaptive.inp"                    = [{matcher = "M011", tol = 1.0E-10, ref = -2.999999996769782}]
+"geo_opt_bfgs_inverse_adaptive.inp"            = [{matcher = "M011", tol = 1.0E-10, ref = -2.999999996856476}]
 #EOF

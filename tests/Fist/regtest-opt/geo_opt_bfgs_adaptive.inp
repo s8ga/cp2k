@@ -1,0 +1,77 @@
+&GLOBAL
+  PRINT_LEVEL LOW
+  PROJECT geo_opt_bfgs_adaptive
+  RUN_TYPE GEO_OPT
+&END GLOBAL
+
+&MOTION
+  &CONSTRAINT
+    &FIXED_ATOMS
+      LIST 1
+    &END FIXED_ATOMS
+  &END CONSTRAINT
+  &GEO_OPT
+    MAX_DR 3.0e-3
+    MAX_FORCE 4.5e-4
+    MAX_ITER 30
+    OPTIMIZER BFGS
+    RMS_DR 1.5e-3
+    RMS_FORCE 3.0e-4
+    &BFGS
+      ADAPTIVE_TRUST_RADIUS ON
+      METHOD DIRECT
+      USE_MODEL_HESSIAN NO
+    &END BFGS
+  &END GEO_OPT
+  &PRINT
+    &RESTART OFF
+    &END RESTART
+    &TRAJECTORY OFF
+    &END TRAJECTORY
+  &END PRINT
+&END MOTION
+
+&FORCE_EVAL
+  METHOD Fist
+  &MM
+    &FORCEFIELD
+      &CHARGE
+        ATOM Ar
+        CHARGE 0.0
+      &END CHARGE
+      &NONBONDED
+        &GENPOT
+          ATOMS Ar Ar
+          FUNCTION -1.5*exp(-3.0*(x-7.0)^2)
+          RCUT 12.0
+          VARIABLES x
+        &END GENPOT
+      &END NONBONDED
+      &SPLINE
+        EMAX_SPLINE 10.0
+        EPS_SPLINE 1.0E-7
+        R0_NB [bohr] 1.0
+      &END SPLINE
+    &END FORCEFIELD
+    &POISSON
+      PERIODIC NONE
+      &EWALD
+        EWALD_TYPE NONE
+      &END EWALD
+    &END POISSON
+  &END MM
+  &SUBSYS
+    &CELL
+      ABC 25.0 25.0 25.0
+      PERIODIC NONE
+    &END CELL
+    &COORD
+      Ar 12.50 12.50 12.50
+      Ar 16.27 12.50 12.50
+      Ar  8.28 12.50 12.50
+    &END COORD
+    &TOPOLOGY
+      CONNECTIVITY OFF
+    &END TOPOLOGY
+  &END SUBSYS
+&END FORCE_EVAL
