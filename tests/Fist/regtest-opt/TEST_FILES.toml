@@ -111,4 +111,6 @@
 "cell_opt_direct_bfgs_inverse.inp"             = [{matcher = "M011", tol = 1.0E-14, ref = -35.644084205321576}]
 "cell_opt_bfgs_inverse_restart_direct.inp"     = [{matcher = "M011", tol = 1.0E-14, ref = -35.644084205353230}]
 "cell_opt_bfgs_inverse_vib.inp"                = [{matcher = "M018", tol = 1.0E-14, ref = 587.912968}]
+# Curvature-capped model step convergence on a soft potential
+"geo_opt_bfgs_capped.inp"                      = [{matcher = "M011", tol = 1.0E-10, ref = -0.077916853281941}]
 #EOF

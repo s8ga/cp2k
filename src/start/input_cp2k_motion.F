@@ -1361,6 +1361,19 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="CAPPED_STEP_CONVERGENCE", &
+                          description="Measures the step-size convergence criteria on the model prediction "// &
+                          "with the Hessian eigenvalues floored at max_force/max_dr, instead of the "// &
+                          "displacement actually taken. Along a curvature softer than that bound the "// &
+                          "displacement criterion reduces to the force criterion, which a noisy SCF "// &
+                          "can still satisfy; the raw Newton step there grows as the inverse curvature "// &
+                          "and can keep the run from ever converging. Supported for METHOD DIRECT "// &
+                          "without USE_RAT_FUN_OPT.", &
+                          usage="CAPPED_STEP_CONVERGENCE", &
+                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="RESTART_HESSIAN", &
                           description="Reads the initial BFGS matrix from file. Hessian and inverse-Hessian "// &
                           "restarts are converted to the selected METHOD when necessary.", &

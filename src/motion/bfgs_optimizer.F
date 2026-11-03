@@ -138,11 +138,11 @@ CONTAINS
       INTEGER                                            :: handle, info, iter_nr, its, &
                                                             matrix_method, maxiter, ndf, &
                                                             output_unit
-      LOGICAL                                            :: conv, hesrest, hess_reset, inverse, &
-                                                            shell_present, should_stop, &
-                                                            use_mod_hes, use_rfo
-      REAL(KIND=dp)                                      :: ediff, emin, eold, etot, pred, rad, rat, &
-                                                            step, t_diff, t_now, t_old
+      LOGICAL :: capped_explicit, capped_step_conv, conv, hesrest, hess_reset, inverse, &
+         shell_present, should_stop, use_mod_hes, use_rfo
+      REAL(KIND=dp)                                      :: ediff, eig_floor, emin, eold, etot, &
+                                                            pred, rad, rat, step, t_diff, t_now, &
+                                                            t_old
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: dg, dr, dx, eigval, gold, work, xold
       REAL(KIND=dp), DIMENSION(:), POINTER               :: g
       TYPE(atomic_kind_list_type), POINTER               :: atomic_kinds
@@ -179,9 +179,25 @@ CONTAINS
       CALL section_vals_val_get(geo_section, "BFGS%USE_RAT_FUN_OPT", l_val=use_rfo)
       CALL section_vals_val_get(geo_section, "BFGS%USE_MODEL_HESSIAN", l_val=use_mod_hes)
       CALL section_vals_val_get(geo_section, "BFGS%RESTART_HESSIAN", l_val=hesrest)
+      CALL section_vals_val_get(geo_section, "BFGS%CAPPED_STEP_CONVERGENCE", &
+                                l_val=capped_step_conv, explicit=capped_explicit)
       IF (inverse .AND. use_rfo) THEN
          CALL cp_abort(__LOCATION__, &
                        "BFGS METHOD INVERSE does not support USE_RAT_FUN_OPT")
+      END IF
+      IF (capped_step_conv .AND. (inverse .OR. use_rfo)) THEN
+         IF (capped_explicit) THEN
+            CALL cp_abort(__LOCATION__, &
+                          "BFGS CAPPED_STEP_CONVERGENCE requires METHOD DIRECT without USE_RAT_FUN_OPT")
+         END IF
+         capped_step_conv = .FALSE.
+      END IF
+      IF (capped_step_conv .AND. (gopt_param%max_dr <= 0.0_dp .OR. gopt_param%max_force <= 0.0_dp)) THEN
+         IF (capped_explicit) THEN
+            CALL cp_abort(__LOCATION__, &
+                          "BFGS CAPPED_STEP_CONVERGENCE requires positive MAX_DR and MAX_FORCE")
+         END IF
+         capped_step_conv = .FALSE.
       END IF
       IF (inverse) THEN
          IF (.NOT. ieee_is_finite(rad) .OR. rad <= 0.0_dp) THEN
@@ -217,6 +233,10 @@ CONTAINS
          ELSE
             WRITE (UNIT=output_unit, FMT="(T2,A,T78,A3)") &
                "BFGS| Restart Hessian: ", " NO"
+         END IF
+         IF (capped_step_conv) THEN
+            WRITE (UNIT=output_unit, FMT="(T2,A,T78,A3)") &
+               "BFGS| Convergence on the curvature-capped model step: ", "YES"
          END IF
          WRITE (UNIT=output_unit, FMT="(T2,A,T61,F20.3)") &
             "BFGS| Trust radius: ", rad
@@ -448,8 +468,22 @@ CONTAINS
                            eold, emin, wildcard, gopt_param, ndf, dr, g, conv, &
                            rat=rat, step=step, rad=rad, used_time=t_diff)
          ELSE
+            ! On a soft collective mode the raw Newton step grows as the inverse
+            ! curvature, so the displacement criterion demands force precision
+            ! far below the SCF noise floor and never settles. Floor the model
+            ! curvature at max_force/max_dr: below that bound the displacement
+            ! criterion is met exactly when the force criterion is, above it the
+            ! criterion measures the true predicted displacement.
+            IF (capped_step_conv) THEN
+               eig_floor = MAX(min_hessian_eigenvalue, gopt_param%max_force/gopt_param%max_dr)
+               CALL geoopt_get_step(ndf, eigval, eigvec_mat, hess_tmp, dx, g, para_env, .FALSE., &
+                                    eig_floor)
+               CALL gopt_f_project_step(gopt_env, dx)
+            ELSE
+               dx(:) = dr(:)
+            END IF
             CALL gopt_f_io(gopt_env, force_env, root_section, its, etot, output_unit, &
-                           eold, emin, wildcard, gopt_param, ndf, dr, g, conv, pred, rat, &
+                           eold, emin, wildcard, gopt_param, ndf, dx, g, conv, pred, rat, &
                            step, rad, used_time=t_diff)
          END IF
 
@@ -1288,15 +1322,18 @@ CONTAINS
 !> \param g ...
 !> \param para_env ...
 !> \param use_rfo ...
+!> \param eig_floor Curvature floor replacing min_hessian_eigenvalue on the
+!>                   non-RFO path (the model step measured for convergence)
 ! **************************************************************************************************
-   SUBROUTINE geoopt_get_step(ndf, eigval, eigvec_mat, hess_tmp, dr, g, para_env, use_rfo)
+   SUBROUTINE geoopt_get_step(ndf, eigval, eigvec_mat, hess_tmp, dr, g, para_env, use_rfo, eig_floor)
 
       INTEGER, INTENT(IN)                                :: ndf
-      REAL(KIND=dp), INTENT(INOUT)                       :: eigval(ndf)
+      REAL(KIND=dp), INTENT(IN)                          :: eigval(ndf)
       TYPE(cp_fm_type), INTENT(IN)                       :: eigvec_mat, hess_tmp
       REAL(KIND=dp), INTENT(INOUT)                       :: dr(ndf), g(ndf)
       TYPE(mp_para_env_type), OPTIONAL, POINTER          :: para_env
       LOGICAL                                            :: use_rfo
+      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: eig_floor
 
       REAL(KIND=dp), PARAMETER                           :: one = 1.0_dp, zero = 0.0_dp
 
@@ -1304,21 +1341,28 @@ CONTAINS
       INTEGER, DIMENSION(:), POINTER                     :: col_indices, row_indices
       REAL(KIND=dp), CONTIGUOUS, DIMENSION(:, :), &
          POINTER                                         :: local_data
+      REAL(KIND=dp), DIMENSION(ndf)                      :: inv_eig
       TYPE(cp_fm_struct_type), POINTER                   :: matrix_struct
       TYPE(cp_fm_type)                                   :: tmp
 
       CALL cp_fm_to_fm(eigvec_mat, hess_tmp)
       IF (use_rfo) THEN
          DO indf = 1, ndf
-            eigval(indf) = one/eigval(indf)
+            inv_eig(indf) = one/eigval(indf)
          END DO
       ELSE
-         DO indf = 1, ndf
-            eigval(indf) = one/MAX(min_hessian_eigenvalue, eigval(indf))
-         END DO
+         IF (PRESENT(eig_floor)) THEN
+            DO indf = 1, ndf
+               inv_eig(indf) = one/MAX(eig_floor, eigval(indf))
+            END DO
+         ELSE
+            DO indf = 1, ndf
+               inv_eig(indf) = one/MAX(min_hessian_eigenvalue, eigval(indf))
+            END DO
+         END IF
       END IF
 
-      CALL cp_fm_column_scale(hess_tmp, eigval)
+      CALL cp_fm_column_scale(hess_tmp, inv_eig)
       CALL cp_fm_get_info(eigvec_mat, matrix_struct=matrix_struct)
       CALL cp_fm_create(tmp, matrix_struct, name="tmp")
       CALL cp_fm_set_all(tmp, alpha=zero)
