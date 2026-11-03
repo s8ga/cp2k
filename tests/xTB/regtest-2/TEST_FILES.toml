@@ -16,6 +16,6 @@
 "HF-dfield.inp"          = [{matcher = "E_total", tol = 1e-12, ref = -5.6605224244239}]
 "HF-dfield-debug.inp"    = []
 "HF-loc-field.inp"       = [{matcher = "E_total", tol = 1e-12, ref = -5.65286303322893}]
-"HF-loc-field-gopt.inp"  = [{matcher = "E_total", tol = 2e-08, ref = -5.65780878972355}]
+"HF-loc-field-gopt.inp"  = [{matcher = "E_total", tol = 2e-08, ref = -5.66726969825159}]
 "HF-loc-field-debug.inp" = []
 #EOF

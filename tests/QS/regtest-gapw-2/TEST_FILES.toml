@@ -6,7 +6,7 @@
 # tests GAPW GTH and ALL
 # High-spin restricted open Kohn-Sham
 "Li-ROKS.inp"              = [{matcher = "E_total", tol = 3e-14, ref = -7.3389104099416302}]
-"NO2-ROKS.inp"             = [{matcher = "E_total", tol = 1.0E-14, ref = -203.77833570926944}]
+"NO2-ROKS.inp"             = [{matcher = "E_total", tol = 1.0E-14, ref = -203.80441744236106}]
 # Level-shifting for ROKS
 "C-levelshift.inp"         = [{matcher = "E_total", tol = 3e-13, ref = -37.44694657908244}]
 # Check restart for nmo = 0

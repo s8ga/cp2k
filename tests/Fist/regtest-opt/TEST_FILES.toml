@@ -4,13 +4,13 @@
 #      for details see cp2k/tools/do_regtest
 #
 # Geometry optimisation
-"geo_opt_bfgs.inp"                             = [{matcher = "M011", tol = 1.0E-14, ref = -35.282422070543703}]
+"geo_opt_bfgs.inp"                             = [{matcher = "M011", tol = 1.0E-14, ref = -35.282422082167535}]
 "geo_opt_cg_2pnt.inp"                          = [{matcher = "M011", tol = 2.0e-14, ref = -35.282422123859703}]
 "geo_opt_cg_fit.inp"                           = [{matcher = "M011", tol = 1.0E-12, ref = -35.28242197359649}]
 "geo_opt_cg_gold.inp"                          = [{matcher = "M011", tol = 1.0E-14, ref = -35.28242198134038}]
 "geo_opt_lbfgs.inp"                            = [{matcher = "M011", tol = 1.0E-14, ref = -35.282422125160856}]
 # Direct cell optimisation (combined geometry and cell optimiser)
-"cell_opt_direct_bfgs.inp"                     = [{matcher = "M011", tol = 1.0E-14, ref = -35.644084205321462}]
+"cell_opt_direct_bfgs.inp"                     = [{matcher = "M011", tol = 1.0E-14, ref = -35.64408420274086}]
 "cell_opt_direct_cg_2pnt.inp"                  = [{matcher = "M011", tol = 2.0E-14, ref = -35.64408417979653}]
 "cell_opt_direct_cg_gold.inp"                  = [{matcher = "M011", tol = 4e-10, ref = -35.64408416148384}]
 "cell_opt_direct_lbfgs.inp"                    = [{matcher = "M011", tol = 3.0E-11, ref = -35.644084204213243}]
@@ -21,7 +21,7 @@
 "cs_geo_opt_cg_gold.inp"                       = [{matcher = "M011", tol = 1.0E-14, ref = -34.16577575379811}]
 "cs_geo_opt_lbfgs.inp"                         = [{matcher = "M011", tol = 1.0E-14, ref = -34.165775670048319}]
 # Direct cell optimisation using core-shell models
-"cs_cell_opt_direct_bfgs.inp"                  = [{matcher = "M011", tol = 1.0E-14, ref = -34.187395867233498}]
+"cs_cell_opt_direct_bfgs.inp"                  = [{matcher = "M011", tol = 1.0E-14, ref = -34.187395867231935}]
 "cs_cell_opt_direct_cg_2pnt.inp"               = [{matcher = "M011", tol = 1.0E-14, ref = -34.18739586859258}]
 "cs_cell_opt_direct_cg_gold.inp"               = [{matcher = "M011", tol = 5e-11, ref = -34.187395868578747}]
 "cs_cell_opt_direct_lbfgs.inp"                 = [{matcher = "M011", tol = 1.0E-14, ref = -34.18739586621215}]
@@ -107,12 +107,12 @@
 "cell_opt_keep_volume.inp"                     = [{matcher = "M011", tol = 1.0E-10, ref = -16.136339196984437}]
 "cell_opt_keep_volume_symmetry.inp"            = [{matcher = "M011", tol = 1.0E-10, ref = -16.13633919692934}]
 # Inverse BFGS
-"geo_opt_bfgs_inverse.inp"                     = [{matcher = "M011", tol = 1.0E-14, ref = -35.282422070543689}]
-"cell_opt_direct_bfgs_inverse.inp"             = [{matcher = "M011", tol = 1.0E-14, ref = -35.644084205321576}]
-"cell_opt_bfgs_inverse_restart_direct.inp"     = [{matcher = "M011", tol = 1.0E-14, ref = -35.644084205353230}]
-"cell_opt_bfgs_inverse_vib.inp"                = [{matcher = "M018", tol = 1.0E-14, ref = 587.912968}]
+"geo_opt_bfgs_inverse.inp"                     = [{matcher = "M011", tol = 1.0E-14, ref = -35.282422106281544}]
+"cell_opt_direct_bfgs_inverse.inp"             = [{matcher = "M011", tol = 1.0E-14, ref = -35.644084202743166}]
+"cell_opt_bfgs_inverse_restart_direct.inp"     = [{matcher = "M011", tol = 1.0E-14, ref = -35.644084205293815}]
+"cell_opt_bfgs_inverse_vib.inp"                = [{matcher = "M018", tol = 1.0E-14, ref = 561.432571}]
 # Curvature-capped model step convergence on a soft potential
-"geo_opt_bfgs_capped.inp"                      = [{matcher = "M011", tol = 1.0E-10, ref = -0.077916853281941}]
+"geo_opt_bfgs_capped.inp"                      = [{matcher = "M011", tol = 1.0E-10, ref = -0.078072173408892}]
 # Adaptive trust-radius control on a stiff/nonconvex Gaussian well
 "geo_opt_bfgs_adaptive.inp"                    = [{matcher = "M011", tol = 1.0E-10, ref = -2.999999996769782}]
 "geo_opt_bfgs_inverse_adaptive.inp"            = [{matcher = "M011", tol = 1.0E-10, ref = -2.999999996856476}]

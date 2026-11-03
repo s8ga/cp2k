@@ -18,7 +18,7 @@
 "ch2o_mos.inp"                  = [{matcher = "E_total", tol = 1.0E-12, ref = -7.84456570306331}]
 "si_print.inp"                  = [{matcher = "E_total", tol = 3.0E-12, ref = -14.7303312364591}]
 "si_band.inp"                   = [{matcher = "E_total", tol = 3.0E-12, ref = -14.7303312364591}]
-"H2O-geo-pdos.inp"              = [{matcher = "E_total", tol = 1.0E-12, ref = -5.76872484352658}]
+"H2O-geo-pdos.inp"              = [{matcher = "E_total", tol = 1.0E-12, ref = -5.76872482538311}]
 "graphite-stm.inp"              = [{matcher = "E_total", tol = 1.0E-12, ref = -7.91403223194017}]
 "si_dos.inp"                    = [{matcher = "E_total", tol = 3.0E-12, ref = -14.7303312364591}]
 "h2o_reaction_path_kinds.inp"   = [{matcher = "M002", tol = 1.0E-12, ref = -5.4296134228}]

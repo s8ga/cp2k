@@ -1,7 +1,7 @@
-"H2O_grad_cg.inp"         = [{matcher = "M011", tol = 8e-08, ref = -16.990049776121932}]
-"H2O_grad_sd.inp"         = [{matcher = "M011", tol = 7e-08, ref = -16.990049436156660}]
-"H2O_grad_pr.inp"         = [{matcher = "M011", tol = 7e-08, ref = -16.990049239382305}]
-"H2O_grad_richardson.inp" = [{matcher = "M011", tol = 7e-08, ref = -16.990050849715541}]
-"H2O_grad_cg_enforce.inp" = [{matcher = "M011", tol = 8e-08, ref = -16.990049776121932}]
-"H2O_grad_cg_recalc.inp"  = [{matcher = "M011", tol = 7e-08, ref = -16.990049367524890}]
+"H2O_grad_cg.inp"         = [{matcher = "M011", tol = 8e-08, ref = -16.992153639257296}]
+"H2O_grad_sd.inp"         = [{matcher = "M011", tol = 7e-08, ref = -16.992153089689324}]
+"H2O_grad_pr.inp"         = [{matcher = "M011", tol = 7e-08, ref = -16.9921531696201}]
+"H2O_grad_richardson.inp" = [{matcher = "M011", tol = 7e-08, ref = -16.992156355163992}]
+"H2O_grad_cg_enforce.inp" = [{matcher = "M011", tol = 8e-08, ref = -16.992153639257307}]
+"H2O_grad_cg_recalc.inp"  = [{matcher = "M011", tol = 7e-08, ref = -16.99215381301344}]
 #EOF

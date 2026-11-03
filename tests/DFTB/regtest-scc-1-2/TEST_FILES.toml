@@ -1,8 +1,8 @@
 # runs are executed in the same order as in this file
 # the second field tells which test should be run in order to compare with the last available output
 # see regtest/TEST_FILES
-"ch2o-3.inp"                 = [{matcher = "E_total", tol = 1.0E-14, ref = -5.7546306080948604}]
-"ch2o-5.inp"                 = [{matcher = "E_total", tol = 6e-14, ref = -5.7546307316870697}]
+"ch2o-3.inp"                 = [{matcher = "E_total", tol = 1.0E-14, ref = -5.7546306054122}]
+"ch2o-5.inp"                 = [{matcher = "E_total", tol = 6e-14, ref = -5.75463072821602}]
 "ch2o.inp"                   = [{matcher = "E_total", tol = 1.0E-14, ref = -5.75087391754637}]
 "ch2o_ls.inp"                = [{matcher = "M011", tol = 1.0E-10, ref = -5.75087390937201}]
 "ch2o-r.inp"                 = [{matcher = "E_total", tol = 1.0E-14, ref = -5.75087391754637}]

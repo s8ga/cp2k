@@ -1371,7 +1371,7 @@ CONTAINS
                           "Cannot be combined with USE_RAT_FUN_OPT, which uses its own step "// &
                           "and trust-radius heuristic.", &
                           usage="ADAPTIVE_TRUST_RADIUS", &
-                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+                          default_l_val=.TRUE., lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
@@ -1384,7 +1384,7 @@ CONTAINS
                           "and can keep the run from ever converging. Supported for METHOD DIRECT "// &
                           "without USE_RAT_FUN_OPT.", &
                           usage="CAPPED_STEP_CONVERGENCE", &
-                          default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+                          default_l_val=.TRUE., lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 

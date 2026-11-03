@@ -12,8 +12,8 @@
 "h2_dbg_-2.inp"        = [{matcher = "M003", tol = 1.0E-14, ref = -14.74473538369448}]
 "water_3_fdbg.inp"     = [{matcher = "M003", tol = 1.0E-14, ref = -348.94150458005100}]
 "water_3_fdbg_inv.inp" = [{matcher = "M003", tol = 1.0E-14, ref = -352.12828908277055}]
-"water_3_full.inp"     = [{matcher = "M007", tol = 1.0E-14, ref = -12.8190719912}]
-"water_3_full_num.inp" = [{matcher = "M007", tol = 1.0E-14, ref = -12.8190719693}]
+"water_3_full.inp"     = [{matcher = "M007", tol = 1.0E-14, ref = -12.8190743495}]
+"water_3_full_num.inp" = [{matcher = "M007", tol = 1.0E-14, ref = -12.819074331}]
 #QMMM Walls
 "water_3_NOwalls.inp"  = [{matcher = "M002", tol = 1.0E-14, ref = -0.127907027267E+02}]
 "water_3_walls.inp"    = [{matcher = "M002", tol = 1.0E-14, ref = -0.127764135533E+02}]

@@ -30,5 +30,5 @@
   {matcher = "M054", tol = 1.0E-14, ref = 0.0E+00},
   {matcher = "M082", tol = 1.0E-14, ref = 0.00000157}
 ]
-"H2O_cs_intra_geo_opt.inp"        = [{matcher = "M011", tol = 1.0E-14, ref = -0.917699614533378}]
+"H2O_cs_intra_geo_opt.inp"        = [{matcher = "M011", tol = 1.0E-14, ref = -0.917699608173373}]
 #EOF

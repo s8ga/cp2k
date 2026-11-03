@@ -10,7 +10,7 @@
 # bug fix for neighborlists
 "h2o-5.inp"        = [{matcher = "E_total", tol = 4e-09, ref = -130.55701170331295}]
 # atomic properties
-"fa_atprop.inp"    = [{matcher = "E_total", tol = 1.0E-14, ref = -5.7546307318903498}]
+"fa_atprop.inp"    = [{matcher = "E_total", tol = 1.0E-14, ref = -5.75463072920918}]
 "fa2_atprop.inp"   = [{matcher = "E_total", tol = 1.0E-14, ref = -5.75087391754637}]
 "h2o_atprop.inp"   = [{matcher = "E_total", tol = 5e-09, ref = -130.55609077057122}]
 # MD properties

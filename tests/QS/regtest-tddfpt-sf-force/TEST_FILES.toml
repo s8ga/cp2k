@@ -8,6 +8,6 @@
 "h2o_pbe_opt.inp"          = [{matcher = "E_total", tol = 1.0E-06, ref = -16.93819797172962}]
 # same as h2o_pbe_opt.inp, but with the analytic third XC derivative
 "h2o_pbe_opt_analytic.inp" = [{matcher = "E_total", tol = 1.0E-06, ref = -16.94191176862850}]
-"h2o_pbe0_opt.inp"         = [{matcher = "E_total", tol = 1.0E-11, ref = -16.94121129393531}]
+"h2o_pbe0_opt.inp"         = [{matcher = "E_total", tol = 1.0E-11, ref = -16.99260563288664}]
 #
 #EOF

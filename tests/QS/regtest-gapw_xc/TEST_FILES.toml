@@ -35,5 +35,5 @@
 "H2O_gpw_full_gapw.inp"        = [{matcher = "E_total", tol = 1e-12, ref = -17.10712931509009}]
 "H2O_gpw.inp"                  = [{matcher = "E_total", tol = 1e-12, ref = -17.10712931509009}]
 "Li-ROKS.inp"                  = [{matcher = "E_total", tol = 1e-12, ref = -6.95585820367831}]
-"NO2-ROKS.inp"                 = [{matcher = "E_total", tol = 1e-12, ref = -41.76059265519767}]
+"NO2-ROKS.inp"                 = [{matcher = "E_total", tol = 1e-12, ref = -41.78598752092736}]
 #EOF

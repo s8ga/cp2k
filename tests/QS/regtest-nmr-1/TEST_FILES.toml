@@ -15,5 +15,5 @@
 "H2O-NMR-12.inp"        = [{matcher = "M014", tol = 1.0E-03, ref = 0.606583E+02}]
 # linres as post sc
 "H2O-NMR-1-postene.inp" = [{matcher = "M014", tol = 4.0E-03, ref = 0.605916E+02}]
-"H2O-NMR-1-postgeo.inp" = [{matcher = "M014", tol = 5.0E-03, ref = 0.641761E+02}]
+"H2O-NMR-1-postgeo.inp" = [{matcher = "M014", tol = 5.0E-03, ref = 59.2558}]
 #EOF

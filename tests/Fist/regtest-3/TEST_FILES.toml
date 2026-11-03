@@ -1,10 +1,10 @@
-"silicon_cluster.inp"      = [{matcher = "M007", tol = 1.0E-14, ref = -14.0002460043}]
+"silicon_cluster.inp"      = [{matcher = "M007", tol = 1.0E-14, ref = -13.8660995544}]
 "silicon_cluster_2.inp"    = [{matcher = "M002", tol = 1.0E-14, ref = -0.141634971034E+02}]
-"silicon_cluster_3.inp"    = [{matcher = "M007", tol = 1.0E-14, ref = -14.5034022524}]
-"silicon_cluster_4.inp"    = [{matcher = "M007", tol = 1.0E-14, ref = -14.5520435455}]
-"silicon_cluster_5.inp"    = [{matcher = "M007", tol = 1.0E-14, ref = -14.566284859}]
+"silicon_cluster_3.inp"    = [{matcher = "M007", tol = 1.0E-14, ref = -14.459311133}]
+"silicon_cluster_4.inp"    = [{matcher = "M007", tol = 1.0E-14, ref = -14.5162988874}]
+"silicon_cluster_5.inp"    = [{matcher = "M007", tol = 1.0E-14, ref = -14.5425974054}]
 # this depends on the previous runs and provides a quick check
-"silicon_cluster_6.inp"    = [{matcher = "M002", tol = 1.0E-14, ref = -0.145636556282E+02}]
+"silicon_cluster_6.inp"    = [{matcher = "M002", tol = 1.0E-14, ref = -14.5405722321}]
 "al2o3.inp"                = [{matcher = "M002", tol = 1.0E-14, ref = -281.495284522}]
 # NPT_F restart
 "al2o3-res.inp"            = [{matcher = "M002", tol = 1.0E-14, ref = -281.517518706}]

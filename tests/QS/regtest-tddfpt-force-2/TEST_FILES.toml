@@ -4,14 +4,14 @@
 #      1 compares the last total energy in the file
 #      for details see cp2k/tools/do_regtest
 #
-"h2o_f11.inp" = [{matcher = "E_total", tol = 5.0E-11, ref = -17.08462172332738}]
+"h2o_f11.inp" = [{matcher = "E_total", tol = 5.0E-11, ref = -17.04457736364418}]
 "h2o_f12.inp" = [{matcher = "E_total", tol = 5.0E-11, ref = -17.23314438613115}]
-"h2o_f13.inp" = [{matcher = "E_total", tol = 5.0E-09, ref = -17.21133582312158}]
-"h2o_f14.inp" = [{matcher = "E_total", tol = 5.0E-11, ref = -17.07269324354837}]
-"h2o_f15.inp" = [{matcher = "E_total", tol = 5.0E-11, ref = -17.18915026270191}]
-"h2o_f16.inp" = [{matcher = "E_total", tol = 5.0E-11, ref = -17.18920549418680}]
-"h2o_f17.inp" = [{matcher = "E_total", tol = 5.0E-11, ref = -17.20475909010159}]
-"h2o_f18.inp" = [{matcher = "E_total", tol = 5.0E-11, ref = -16.70951393308345}]
-"h2o_f19.inp" = [{matcher = "E_total", tol = 5.0E-11, ref = -17.21016951388176}]
-"h2o_f20.inp" = [{matcher = "E_total", tol = 5.0E-11, ref = -17.18911876899797}]
+"h2o_f13.inp" = [{matcher = "E_total", tol = 5.0E-09, ref = -17.21283577744071}]
+"h2o_f14.inp" = [{matcher = "E_total", tol = 5.0E-11, ref = -17.04367917153971}]
+"h2o_f15.inp" = [{matcher = "E_total", tol = 5.0E-11, ref = -17.21931509881419}]
+"h2o_f16.inp" = [{matcher = "E_total", tol = 5.0E-11, ref = -17.21912273678579}]
+"h2o_f17.inp" = [{matcher = "E_total", tol = 5.0E-11, ref = -17.21381306564719}]
+"h2o_f18.inp" = [{matcher = "E_total", tol = 5.0E-11, ref = -16.7462858514126}]
+"h2o_f19.inp" = [{matcher = "E_total", tol = 5.0E-11, ref = -17.21466696079008}]
+"h2o_f20.inp" = [{matcher = "E_total", tol = 5.0E-11, ref = -17.21982344355131}]
 #EOF

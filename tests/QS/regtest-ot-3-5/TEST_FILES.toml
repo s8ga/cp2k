@@ -15,6 +15,6 @@
   {matcher = "M_INIT_ENERGY", tol = 1e-8, ref = -4.065278275060435},
   {matcher = "M_CONS_QTY", tol = 1e-8, ref = -4.06478643187},
 ]
-"Al-kpoint-mermin-geo-opt.inp"        = [{matcher = "E_total", tol = 1e-8, ref = -4.06534815637185}]
-"Al-kpoint-mermin-cell-opt.inp"       = [{matcher = "E_total", tol = 1e-8, ref = -2.08597923726350}]
+"Al-kpoint-mermin-geo-opt.inp"        = [{matcher = "E_total", tol = 1e-8, ref = -4.06532998959691}]
+"Al-kpoint-mermin-cell-opt.inp"       = [{matcher = "E_total", tol = 1e-8, ref = -2.08556033202715}]
 #EOF

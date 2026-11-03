@@ -27,7 +27,7 @@
 "h2o-32_4.inp"                    = [{matcher = "E_total", tol = 2e-13, ref = -131.07520912214875}]
 "MoS.inp"                         = [{matcher = "E_total", tol = 1.0E-14, ref = -2.99616182900092}]
 "n2.inp"                          = [{matcher = "E_total", tol = 1.0E-14, ref = -4.8656072957458099}]
-"s2.inp"                          = [{matcher = "E_total", tol = 1.0E-14, ref = -4.8373181011770399}]
+"s2.inp"                          = [{matcher = "E_total", tol = 1.0E-14, ref = -4.8373181023267}]
 # atomic properties
 "ch2o_atprop.inp"                 = [{matcher = "E_total", tol = 1.0E-14, ref = -5.81281420275335}]
 "MoS_atprop.inp"                  = [{matcher = "E_total", tol = 1.0E-14, ref = -2.99616182900092}]
